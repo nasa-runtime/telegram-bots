@@ -9,7 +9,7 @@ use std::{
 };
 use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 
-use crate::error::ApiError;
+use crate::service::ApiError;
 use nasa::web::StatusCode;
 
 type Work = Pin<Box<dyn Future<Output = ()> + Send>>;

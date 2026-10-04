@@ -5,6 +5,7 @@ use std::{
 };
 
 use anyhow::{ensure, Result};
+use nasa::application::DependencyState;
 use serde::Serialize;
 use tokio::{
     sync::Semaphore,
@@ -13,9 +14,9 @@ use tokio::{
 use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
 
 use crate::{
-    dispatch::{Context, Counters, Queue, Worker},
+    catalog::source::{Candidate, CatalogSource, LoadAttempt},
+    partition::{Context, Counters, Queue, Worker},
     service::Catalog,
-    source::{Candidate, CatalogSource, LoadAttempt},
 };
 
 /// 配置控制面只返回部署状态与固定错误摘要，不暴露目录正文和凭据来源。
@@ -47,6 +48,7 @@ struct LiveWorker {
 
 /// 唯一目录管理任务拥有所有当前、排空中和候选工作者。
 pub struct CatalogManager {
+    readiness: nasa::application::ReadinessContributor,
     service: Arc<TelegramService>,
     source: CatalogSource,
     initial: Vec<Worker>,
@@ -56,11 +58,12 @@ pub struct CatalogManager {
 
 impl TelegramService {
     /// 业务作用：从已完整加载的候选准备启动目录及唯一生命周期管理器。
-    /// 参数说明：`source` 固定配置来源；`candidate` 是启动前校验的目录与材料。
+    /// 参数说明：`source` 固定配置来源；`candidate` 是启动前校验的目录与材料；`readiness` 控制目录就绪贡献。
     /// 返回：全部凭据及发送资源有效时返回 REST 资源与管理器，尚不产生 Telegram 请求。
     pub fn prepare(
         source: CatalogSource,
         candidate: Candidate,
+        readiness: nasa::application::ReadinessContributor,
     ) -> Result<(Arc<Self>, CatalogManager)> {
         let context = Arc::new(Context {
             revision: std::sync::Mutex::new(None),
@@ -85,12 +88,17 @@ impl TelegramService {
             context,
         });
         let manager = CatalogManager {
+            readiness,
             service: service.clone(),
             source,
             initial,
             workers: BTreeMap::new(),
             tasks: JoinSet::new(),
         };
+        // 初始化已具备完整资源，长期任务由 Ready 屏障激活；未知就绪状态不能阻塞该激活过程。
+        manager
+            .readiness
+            .observe(DependencyState::Ready, "catalog_prepared", Instant::now());
         Ok((service, manager))
     }
 
@@ -112,6 +120,25 @@ impl TelegramService {
             .read()
             .unwrap_or_else(|p| p.into_inner())
             .clone()
+    }
+
+    /// 业务作用：撤销所有目录代的受理权，关闭当前队列以允许消费者排空。
+    /// 参数说明：无。
+    /// 返回：重复调用安全；已被请求持有的旧目录也无法继续入队。
+    pub(crate) fn close(&self) {
+        // 权威先失效再关闭队列，避免并发请求把消息交给正在退出的消费者。
+        *self
+            .context
+            .revision
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
+        self.status
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .stopping = true;
+        for bot in self.snapshot().bots.values() {
+            bot.queue.close();
+        }
     }
 }
 
@@ -186,11 +213,18 @@ impl CatalogManager {
                         // 辅助进程完成或被终止回收后才释放本轮；同一时刻只存在一个读取执行域。
                         let source = self.source.clone();
                         let read_cancel = read_cancel.clone();
-                        loading = Some(AbortOnDropHandle::new(tokio::spawn(crate::isolated::reload(source, read_cancel))));
+                        loading = Some(AbortOnDropHandle::new(tokio::spawn(crate::catalog::reader::reload(source, read_cancel))));
                     }
                 }
             }
         }
+        // 管理器退出即撤销接流，不能在等待读取回收或排空期间继续返回受理成功。
+        self.readiness.observe(
+            DependencyState::NotReady,
+            "catalog_stopping",
+            Instant::now(),
+        );
+        self.service.close();
         if let Some(job) = loading {
             // 先撤销读取并回收材料持有者，再进入发送队列排空；停机中不得留下新候选。
             read_cancel.cancel();
@@ -354,17 +388,7 @@ impl CatalogManager {
     /// 参数说明：无。
     /// 返回：所有工作者退出后记录累计未发送丢弃和结果未知数量。
     async fn stop(&mut self) {
-        *self
-            .service
-            .context
-            .revision
-            .lock()
-            .unwrap_or_else(|p| p.into_inner()) = None;
-        self.service
-            .status
-            .write()
-            .unwrap_or_else(|p| p.into_inner())
-            .stopping = true;
+        self.service.close();
         let deadline = Instant::now()
             + Duration::from_millis(self.service.snapshot().dispatcher.shutdown_timeout_ms);
         for worker in self.workers.values_mut() {
@@ -422,12 +446,9 @@ impl Drop for CatalogManager {
     /// 参数说明：无。
     /// 返回：只关闭门禁与队列，不尝试阻塞等待。
     fn drop(&mut self) {
-        *self
-            .service
-            .context
-            .revision
-            .lock()
-            .unwrap_or_else(|p| p.into_inner()) = None;
+        self.readiness
+            .observe(DependencyState::NotReady, "catalog_stopped", Instant::now());
+        self.service.close();
         for worker in self.workers.values() {
             worker.queue.close();
         }

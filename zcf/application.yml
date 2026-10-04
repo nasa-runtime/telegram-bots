@@ -4,6 +4,17 @@ application:
   startup_timeout_ms: 30000
   shutdown_timeout_ms: 60000
 
+log:
+  level: ${TELEGRAM_LOG_LEVEL:info}
+  # 日志目录需可写；显式将 TELEGRAM_LOG_PATH 设为空可只输出控制台。
+  path: ${TELEGRAM_LOG_PATH:/usr/local/logs/telegram-bots}
+  max_file_size: 100MB
+  total_size_cap: 1GB
+  max_history_days: 7
+  clean_history_on_start: true
+  split_error_file: true
+  color: false
+
 server:
   host: 0.0.0.0
   port: 2060
@@ -17,7 +28,7 @@ rest_discovery:
 
 yml:
   imports:
-    - file: /etc/conf/telegram-bots.yml
+    - file: ${TELEGRAM_YML:/etc/conf/telegram-bots.yml}
       optional: false
 
 config_watch:

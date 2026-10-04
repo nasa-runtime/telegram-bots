@@ -24,7 +24,7 @@ jobs:
       - name: Lint
         run: cargo +${{ matrix.toolchain }} clippy --all-targets --locked -- -D warnings
       - name: Build
-        run: cargo +${{ matrix.toolchain }} build --locked
+        run: cargo +${{ matrix.toolchain }} build --locked --bin telegram-bots
       - name: Documentation
         run: cargo +${{ matrix.toolchain }} doc --locked --no-deps
         env:

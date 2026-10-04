@@ -2,7 +2,7 @@ FROM rust:1.94-bookworm AS builder
 WORKDIR /workspace
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-RUN cargo build --locked --release
+RUN cargo build --locked --release --bin telegram-bots
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \

@@ -1,13 +1,16 @@
-use std::{collections::BTreeMap, fs::OpenOptions, io::Read, path::Path};
+use std::{collections::BTreeMap, path::Path};
 
 use anyhow::{ensure, Result};
-use nasa::yml::{ConfigFormat, YmlLoader, YmlOverlay};
+use config::{Config, Environment, File, FileFormat};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
-use crate::config::{valid_id, TelegramConfig};
+use crate::{
+    catalog::config::{valid_id, TelegramConfig},
+    catalog::reader::FileReader,
+};
 
 const MAX_DOCUMENT: usize = 1_048_576;
 pub(crate) const MAX_GENERATION: u64 = 9_007_199_254_740_991;
@@ -15,8 +18,6 @@ pub(crate) const MAX_GENERATION: u64 = 9_007_199_254_740_991;
 /// 引导文件固定来源与轮询预算，外部目录不能改变这些控制项。
 #[derive(Clone, Serialize, Deserialize)]
 pub struct CatalogSource {
-    #[serde(skip, default = "standard_loader")]
-    loader: YmlLoader,
     bootstrap: Value,
     imports: Vec<FileImport>,
     pub poll_interval_ms: u64,
@@ -93,12 +94,12 @@ pub struct LoadAttempt {
 }
 
 impl CatalogSource {
-    /// 业务作用：在应用 runtime 和基础设施启动前固定可信引导设置。
-    /// 参数说明：无。
+    /// 业务作用：通过受管读取者固定目录所需的可信引导设置。
+    /// 参数说明：`reader` 隔离可能阻塞的文件系统操作。
     /// 返回：来源合法且引导文件不含业务目录时返回加载器；否则拒绝启动。
-    pub(crate) fn standard() -> Result<Self> {
-        let loader = standard_loader();
-        let bootstrap = bootstrap_tree(&loader)?;
+    pub(crate) async fn standard(reader: &mut FileReader) -> Result<Self> {
+        let documents = bootstrap_documents(reader).await?;
+        let bootstrap = bootstrap_tree(&documents)?;
         let imports: Imports =
             serde_json::from_value(bootstrap.get("yml").cloned().unwrap_or(Value::Null))
                 .map_err(|_| anyhow::anyhow!("yml.imports 必须是显式 file 与 optional 列表"))?;
@@ -129,7 +130,6 @@ impl CatalogSource {
             "配置观察必须启用，轮询为 100..=1000 毫秒，读取预算为 100..=3000 毫秒"
         );
         Ok(Self {
-            loader,
             bootstrap,
             imports: imports.imports,
             poll_interval_ms: watch.poll_interval_ms,
@@ -137,35 +137,60 @@ impl CatalogSource {
         })
     }
 
+    /// 业务作用：确认目录使用的引导设置与 napp 已启动的组件使用同一份配置。
+    /// 参数说明：`application` 是框架初始化时固定的配置快照。
+    /// 返回：引导树一致才允许发布资源；读取期间引导发生变化时拒绝启动。
+    pub(crate) fn validate_bootstrap(&self, application: &Value) -> Result<()> {
+        let mut bootstrap = application.clone();
+        if let Some(object) = bootstrap.as_object_mut() {
+            for key in ["telegram", "secrets", "generation"] {
+                object.remove(key);
+            }
+        }
+        // 两个读取者必须共享监听、身份和预算，不能让目录基于另一份引导配置开放接流。
+        ensure!(
+            bootstrap == self.bootstrap,
+            "目录与应用的引导配置不一致，拒绝启动"
+        );
+        Ok(())
+    }
+
     /// 业务作用：整批读取文件、环境覆盖与绑定摘要的凭据，形成可原子发布的候选。
-    /// 参数说明：无。
+    /// 参数说明：`reader` 提供本轮独占的隔离文件通道。
     /// 返回：所有文件部署代号一致且凭据摘要匹配才成功；失败保留可观测代号。
-    pub(crate) fn load(&self) -> LoadAttempt {
+    pub(crate) async fn load(&self, reader: &mut FileReader) -> LoadAttempt {
         let mut desired_revision = None;
-        let result = self.load_inner(&mut desired_revision);
+        let result = self.load_inner(&mut desired_revision, reader).await;
         LoadAttempt {
             desired_revision,
             result,
         }
     }
 
-    /// 业务作用：把固定导入链作为 naml 内存 overlay 合并，禁止业务文件越权改变引导项。
-    /// 参数说明：`desired` 接收第一个有效文件声明的部署代号。
+    /// 业务作用：按 naml 的分层规则合并已读取的内存文档，禁止业务文件越权改变引导项。
+    /// 参数说明：`desired` 接收第一个有效部署代号；`reader` 只执行受限文件读取。
     /// 返回：配置、凭据和来源复验全部成功后返回完整候选。
-    fn load_inner(&self, desired: &mut Option<u64>) -> Result<Candidate> {
-        let boot = bootstrap_tree(&self.loader)?;
+    async fn load_inner(
+        &self,
+        desired: &mut Option<u64>,
+        reader: &mut FileReader,
+    ) -> Result<Candidate> {
+        let mut documents = bootstrap_documents(reader).await?;
+        let boot = bootstrap_tree(&documents)?;
         ensure!(
             boot == self.bootstrap,
             "引导配置或活动 profile 已改变，需要恢复原文件或重启"
         );
-        let mut overlays = Vec::new();
         let mut observed = Vec::new();
         for import in &self.imports {
-            let bytes = read_file(&import.file, MAX_DOCUMENT, import.optional)?;
+            let bytes = reader
+                .read(&import.file, MAX_DOCUMENT, import.optional, false)
+                .await?;
             let Some(bytes) = bytes else {
                 observed.push((import, None));
                 continue;
             };
+            ensure!(!bytes.is_empty(), "外部 YAML 文件不能为空");
             let document: Value = serde_yaml::from_slice(&bytes)
                 .map_err(|_| anyhow::anyhow!("外部 YAML 结构无效"))?;
             let object = document
@@ -189,15 +214,13 @@ impl CatalogSource {
                 "导入文件的 generation 不一致"
             );
             *desired = Some(revision);
-            let content = String::from_utf8(bytes.clone())
+            let content = String::from_utf8(bytes.to_vec())
                 .map_err(|_| anyhow::anyhow!("外部 YAML 必须为 UTF-8"))?;
-            overlays.push(YmlOverlay::required("catalog", content, ConfigFormat::Yaml));
+            documents.push((content, FileFormat::Yaml));
             observed.push((import, Some(bytes)));
         }
-        let tree = self
-            .loader
-            .load_tree_with_overlays(&overlays)
-            .map_err(|_| anyhow::anyhow!("完整目录合并或占位符解析失败"))?;
+        tokio::task::yield_now().await;
+        let tree = merge_documents(&documents, true)?;
         let revision = desired.ok_or_else(|| anyhow::anyhow!("必需目录为空"))?;
         ensure!(
             tree.get("generation").and_then(Value::as_u64) == Some(revision),
@@ -231,7 +254,11 @@ impl CatalogSource {
                 file.sha256.len() == 64 && file.sha256.bytes().all(|b| b.is_ascii_hexdigit()),
                 "凭据 sha256 格式无效"
             );
-            let bytes = Zeroizing::new(read_file(&file.file, 513, false)?.unwrap_or_default());
+            let bytes = reader
+                .read(&file.file, 513, false, false)
+                .await?
+                .unwrap_or_default();
+            ensure!(!bytes.is_empty(), "凭据文件不能为空");
             let digest = format!("{:x}", Sha256::digest(bytes.as_slice()));
             // YAML 固定确切材料摘要，ConfigMap 与 Secret 分别切换时不可能发布新目录配旧凭据。
             ensure!(
@@ -248,12 +275,15 @@ impl CatalogSource {
         // 再读导入链以识别原子替换和可选来源增删；一轮不能混用不同文件集合。
         for (import, previous) in observed {
             ensure!(
-                read_file(&import.file, MAX_DOCUMENT, import.optional)? == previous,
+                reader
+                    .read(&import.file, MAX_DOCUMENT, import.optional, false)
+                    .await?
+                    == previous,
                 "配置来源在读取期间发生变化"
             );
         }
         ensure!(
-            bootstrap_tree(&self.loader)? == self.bootstrap,
+            bootstrap_tree(&bootstrap_documents(reader).await?)? == self.bootstrap,
             "引导配置在读取期间发生变化"
         );
         config.validate_materials(&materials)?;
@@ -265,13 +295,6 @@ impl CatalogSource {
             materials,
         })
     }
-}
-
-/// 业务作用：在隔离进程内重建固定格式与文件大小限制的引导加载器。
-/// 参数说明：无。
-/// 返回：遵循标准来源规则、单文件最多 1 MiB 的加载器，尚不读取文件。
-fn standard_loader() -> YmlLoader {
-    YmlLoader::standard().max_file_bytes(MAX_DOCUMENT)
 }
 
 /// 业务作用：限制受信挂载路径语法，拒绝路径穿越和未实现的通配符。
@@ -290,64 +313,128 @@ fn validate_path(value: &str) -> Result<()> {
     Ok(())
 }
 
-/// 业务作用：通过同一文件句柄进行有界读取，避免设备、管道或巨型输入占用配置加载器。
-/// 参数说明：`path` 为来源路径；`limit` 为字节上限；`optional` 只允许缺失文件被跳过。
-/// 返回：非空普通文件字节；缺失可选文件返回 None，其它失败只返回脱敏摘要。
-fn read_file(path: &str, limit: usize, optional: bool) -> Result<Option<Vec<u8>>> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
+/// 业务作用：通过隔离通道读取主文件及活动 profile，保持标准来源的格式优先级。
+/// 参数说明：`reader` 是本轮唯一文件读取者。
+/// 返回：按主文件、profile 顺序返回纯内存文档；非法来源拒绝整轮加载。
+async fn bootstrap_documents(reader: &mut FileReader) -> Result<Vec<(String, FileFormat)>> {
+    let bytes = reader
+        .read("zcf/application.yml", MAX_DOCUMENT, false, false)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("引导文件不可用"))?;
+    let mut documents = vec![(document_text(&bytes), FileFormat::Yaml)];
+    if let Some(profile) = std::env::var("APP_PROFILE")
+        .ok()
+        .map(|p| p.trim().to_owned())
+        .filter(|p| !p.is_empty())
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NONBLOCK);
+        let base = format!("zcf/application-{profile}");
+        let mut candidates = vec![base.clone()];
+        candidates.extend(
+            ["toml", "json", "yaml", "yml"]
+                .iter()
+                .map(|extension| format!("{base}.{extension}")),
+        );
+        for path in candidates {
+            let Some(bytes) = reader.read(&path, MAX_DOCUMENT, true, true).await? else {
+                continue;
+            };
+            let format = match Path::new(&path)
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(str::to_ascii_lowercase)
+                .as_deref()
+            {
+                Some("toml") => FileFormat::Toml,
+                Some("json") => FileFormat::Json,
+                Some("yml" | "yaml") => FileFormat::Yaml,
+                _ => anyhow::bail!("活动 profile 文件格式无效"),
+            };
+            documents.push((document_text(&bytes), format));
+            break;
+        }
     }
-    let file = match options.open(path) {
-        Ok(file) => file,
-        Err(error) if optional && error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(_) => anyhow::bail!("配置或凭据文件无法读取"),
-    };
-    ensure!(
-        file.metadata()
-            .map_err(|_| anyhow::anyhow!("文件类型检查失败"))?
-            .is_file(),
-        "配置或凭据来源必须为普通文件"
-    );
-    let mut bytes = Vec::new();
-    file.take(limit as u64 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| anyhow::anyhow!("文件读取失败"))?;
-    ensure!(
-        !bytes.is_empty() && bytes.len() <= limit,
-        "配置或凭据文件为空或超过大小上限"
-    );
-    Ok(Some(bytes))
+    Ok(documents)
+}
+
+/// 业务作用：将引导来源字节转换为与 naml 标准加载一致的文本。
+/// 参数说明：`bytes` 是已验证大小的文件内容。
+/// 返回：去除 UTF-8 BOM 的文本，非法 UTF-8 字节按标准加载规则替换。
+fn document_text(bytes: &[u8]) -> String {
+    let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// 业务作用：在内存中完成叶子级合并、环境覆盖与 naml 占位符解析，避免解析器重新打开文件。
+/// 参数说明：`documents` 是按优先级排列的完整文档；`environment` 决定是否应用最终环境覆盖及占位符。
+/// 返回：完整配置树；解析失败只返回脱敏摘要，不发布半份目录。
+fn merge_documents(documents: &[(String, FileFormat)], environment: bool) -> Result<Value> {
+    let mut builder = Config::builder();
+    for (text, format) in documents {
+        builder = builder.add_source(File::from_str(text, *format));
+    }
+    let base = builder
+        .build()
+        .map_err(|_| anyhow::anyhow!("配置文档合并失败"))?;
+    let baseline: Value = base
+        .clone()
+        .try_deserialize()
+        .map_err(|_| anyhow::anyhow!("配置结构无效"))?;
+    if !environment {
+        return Ok(baseline);
+    }
+    let mut tree: Value = Config::builder()
+        .add_source(base)
+        .add_source(
+            Environment::with_prefix("APP")
+                .separator("__")
+                .try_parsing(true),
+        )
+        .build()
+        .and_then(|c| c.try_deserialize())
+        .map_err(|_| anyhow::anyhow!("环境覆盖合并失败"))?;
+    // 文件中已声明为字符串的叶子保持字符串类型，数字形式的凭据和标识不能被环境解析改成整数。
+    for (key, value) in std::env::vars() {
+        let normalized = key.to_ascii_lowercase();
+        let Some(path) = normalized.strip_prefix("app__") else {
+            continue;
+        };
+        let path = path.replace("__", ".");
+        if path
+            .split('.')
+            .try_fold(&baseline, |node, key| node.get(key))
+            .is_some_and(Value::is_string)
+        {
+            if let Some(target) = path
+                .split('.')
+                .try_fold(&mut tree, |node, key| node.get_mut(key))
+            {
+                *target = Value::String(value);
+            }
+        }
+    }
+    nasa::yml::resolve_placeholders(&mut tree)
+        .map_err(|_| anyhow::anyhow!("完整目录占位符解析失败"))?;
+    Ok(tree)
 }
 
 /// 业务作用：区分文件内禁止的业务配置与允许的最终环境覆盖，固定引导控制面。
-/// 参数说明：`loader` 为固定本地来源加载器。
+/// 参数说明：`documents` 是已隔离读取的引导与 profile 文档。
 /// 返回：仅含引导节点的解析树；文件中夹带目录或凭据时失败。
-fn bootstrap_tree(loader: &YmlLoader) -> Result<Value> {
+fn bootstrap_tree(documents: &[(String, FileFormat)]) -> Result<Value> {
     ensure!(
         !std::env::vars_os().any(|(key, _)| key
             .to_string_lossy()
             .starts_with("TELEGRAM_BOOTSTRAP_FILE_ONLY")),
         "保留环境变量前缀不能用于部署配置"
     );
-    let raw = loader
-        .clone()
-        .env_prefix("TELEGRAM_BOOTSTRAP_FILE_ONLY")
-        .resolve_placeholders(false)
-        .load_tree()
-        .map_err(|_| anyhow::anyhow!("引导文件结构无效"))?;
+    let raw = merge_documents(documents, false)?;
     ensure!(
         ["telegram", "secrets", "generation"]
             .iter()
             .all(|key| raw.get(key).is_none()),
         "引导文件不能包含目录、凭据或部署代号"
     );
-    let mut resolved = loader
-        .load_tree()
-        .map_err(|_| anyhow::anyhow!("引导配置读取或占位符解析失败"))?;
+    let mut resolved = merge_documents(documents, true)?;
     let object = resolved
         .as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("引导配置必须为对象"))?;

@@ -1,61 +1,10 @@
 use std::sync::Arc;
 
 use http_body_util::{BodyExt, LengthLimitError, Limited};
-use nasa::web::{
-    auth::AuthContext, get_mapping, interceptor, post_mapping, Extension, IntoResponse, Json, Next,
-    Path, Request, Response, State, StatusCode,
-};
-use telegram_bots::{
-    error::ApiError,
-    runtime::TelegramService,
-    service::{AcceptedReceipt, Caller, Catalog, SendMessage},
-};
+use nasa::web::{get_mapping, post_mapping, Extension, Json, Path, Request, State, StatusCode};
+use telegram_bots::service::{AcceptedReceipt, ApiError, Caller, Catalog, SendMessage};
 
-/// 业务作用：在 naweb 身份阶段校验调用方并固定本次请求的权限与发送资源。
-/// 参数说明：`app` 提供受管资源；`request` 包含候选凭据；`next` 是 required 身份门禁及后续端点。
-/// 返回：认证有效时写入 AuthContext；无效或资源已关闭时立即拒绝，不读取消息正文。
-#[interceptor(id = "telegram-client", kind = "auth", order = 100)]
-async fn authenticate(
-    State(app): State<nasa::Application>,
-    mut request: Request,
-    next: Next,
-) -> Response {
-    let service = match app.resource::<Arc<TelegramService>>().await {
-        Ok(resource) => Arc::clone(&resource),
-        Err(_) => {
-            return ApiError::not_sent(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "service_unavailable",
-                "发送资源尚未就绪或已关闭",
-            )
-            .into_response()
-        }
-    };
-    let runtime = service;
-    let service = runtime.snapshot();
-    let caller = match service.authenticate(request.headers()) {
-        Ok(caller) => caller,
-        Err(error) => return error.into_response(),
-    };
-    let subject: Arc<str> = Arc::from(
-        request
-            .headers()
-            .get("x-client-id")
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or_default(),
-    );
-    // subject 已由凭据校验确认；required gate 只消费这里建立的可信身份，不接受正文自报身份。
-    request.extensions_mut().insert(AuthContext {
-        subject,
-        tenant: Arc::from("telegram-bots"),
-        authentication_kind: "service-key",
-        principal: caller.clone(),
-    });
-    request.extensions_mut().insert(caller);
-    request.extensions_mut().insert(service);
-    request.extensions_mut().insert(runtime);
-    next.run(request).await
-}
+use super::auth::authenticate;
 
 /// 业务作用：帮助业务方选择其权限范围内的机器人和目的地。
 /// 参数说明：`service` 是认证阶段固定的发送目录；`caller` 是认证身份。
@@ -118,18 +67,4 @@ async fn send_message(
     service
         .enqueue(&app, &caller, &bot_id, message)
         .map(|receipt| (StatusCode::ACCEPTED, Json(receipt)))
-}
-
-/// 业务作用：让授权调用方查看目录部署、拒绝原因与机器人排空状态。
-/// 参数说明：`service` 是受管目录资源。
-/// 返回：脱敏控制面快照，不含 token、chat_id、文件路径或其它调用方权限。
-#[get_mapping(
-    path = "/api/config/status",
-    auth = "required",
-    interceptors(authenticate)
-)]
-async fn config_status(
-    Extension(service): Extension<Arc<TelegramService>>,
-) -> Json<telegram_bots::runtime::CatalogStatus> {
-    Json(service.observation())
 }

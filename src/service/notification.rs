@@ -13,11 +13,11 @@ use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 use crate::{
-    config::{BotConfig, TelegramConfig},
-    error::ApiError,
+    catalog::config::{BotConfig, TelegramConfig},
+    service::ApiError,
 };
 
-use crate::dispatch::{unavailable, Context, DeliveryGuard, Queue, Worker};
+use crate::partition::{unavailable, Context, DeliveryGuard, Queue, Worker};
 
 /// 只接受文本与预配置目的地选择，不接受凭据或任意 Telegram 参数。
 #[derive(Deserialize)]
@@ -81,8 +81,8 @@ pub struct Catalog {
     pub(crate) context: Arc<Context>,
     pub revision: u64,
     pub(crate) fingerprint: [u8; 32],
-    pub(crate) http: crate::config::HttpConfig,
-    pub(crate) dispatcher: crate::config::DispatcherConfig,
+    pub(crate) http: crate::catalog::config::HttpConfig,
+    pub(crate) dispatcher: crate::catalog::config::DispatcherConfig,
 }
 
 pub(crate) struct Transport {
@@ -113,7 +113,7 @@ impl Catalog {
         let mut credentials = BTreeSet::new();
         for (id, caller) in config.clients {
             let credential = resolve(&caller.credential)?;
-            let credential_hash = crate::config::credential_hash(&credential)?;
+            let credential_hash = crate::catalog::config::credential_hash(&credential)?;
             ensure!(
                 credentials.insert(credential_hash),
                 "不同调用方必须使用不同凭据"
@@ -139,7 +139,7 @@ impl Catalog {
                     bot.destinations.keys().next().cloned().unwrap_or_default();
             }
             let token = resolve(&bot.token)?;
-            let identity = crate::config::telegram_identity(&token)?;
+            let identity = crate::catalog::config::telegram_identity(&token)?;
             ensure!(
                 identities.insert(identity.clone()),
                 "同一 Telegram 身份只能配置一个别名"

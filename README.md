@@ -4,7 +4,7 @@
 
 面向业务服务的多机器人 Telegram 文本通知网关。调用方只提交机器人别名、目的地别名和正文；token、聊天身份与调用权限由服务集中管理。修改外部 YAML 和凭据文件即可增删机器人、轮换凭据及调整授权，无需重建镜像或重启进程。
 
-服务使用 crates.io 的 `nasa 2.0.1`，提供有界内存队列、每个 Telegram 身份的串行发送、独立排队容量、全局出站限额，以及可观测的配置拒绝和限时排空。`202 Accepted` 只确认内存受理，不表示 Telegram 已发送或用户已收到。
+服务使用 crates.io 的 `nasa 2.0.1`，通过 `#[nasa::application("log", "web", "nacos-discovery")]` 由 napp 管理启动、业务初始化、就绪与停机，提供有界内存队列、每个 Telegram 身份的串行发送、独立排队容量、全局出站限额，以及可观测的配置拒绝和限时排空。`202 Accepted` 只确认内存受理，不表示 Telegram 已发送或用户已收到。
 
 ## 核心能力与边界
 
@@ -16,19 +16,62 @@
 
 只支持文本 `sendMessage`。不提供消息持久化、结果查询、自动补发、幂等存储、入站 Telegram webhook、集群选主或跨实例去重。同一 Telegram 身份只能由一个活动实例负责；默认部署为单副本，更新镜像时先停止旧实例。
 
+## 应用生命周期
+
+入口只声明框架组件并通过 `app` 登记 `telegram-catalog` hosted initializer。napp 负责运行时、信号、Web 路由、探针、指标与可选 Nacos 注册发现；初始化阶段校验外部目录和凭据，登记受管资源，随后把目录管理器暂存为 critical 任务。全部初始化和组件 Ready 成功后才启动消费者。初始化失败不开放监听；启动和运行阶段的 SIGTERM/SIGINT 均由 napp 处理，正常清理完成后返回成功退出码；运行中管理器异常退出会撤销受理权并触发统一停机。
+
+入口中的 `app` 装配业务生命周期：
+
+```rust
+/// 业务作用：把通知目录生命周期交给 napp。
+/// 参数说明：`app` 是尚未开放业务入口的应用容器。
+/// 返回：登记成功后继续初始化，目录不可用时拒绝启动。
+#[nasa::application("log", "web", "nacos-discovery")]
+async fn main(app: nasa::Application) -> anyhow::Result<()> {
+    telegram_bots::application::install(&app)?;
+    Ok(())
+}
+```
+
+服务只有一个可执行文件。每轮配置读取由主程序 fork 出只读子进程，通过匿名通道返回文件字节；父进程在内存中合并和校验，子进程不重新启动 napp、Nacos 或 HTTP 服务。受管清理动作负责回收启动阶段的读取进程。`zcf/application.yml` 和活动 profile 由 napp 标准入口同步读取，必须使用可靠、不可变的本地文件；它们的首次读取不受业务 `catalog_watch.load_timeout_ms` 限制。外部目录与凭据的文件读取有超时和进程回收保护。
+
+## 源码组织
+
+`src/` 根目录只保留 `main.rs` 应用入口与 `lib.rs` 模块入口，业务代码按职责归类：
+
+| 目录 | 职责 |
+| --- | --- |
+| `rest/` | REST 认证拦截器、机器人查询与消息提交、配置状态接口 |
+| `application/` | 通过 app 登记初始化、就绪贡献、关键任务及受管资源清理 |
+| `service/` | 调用方权限、目的地选择、通知受理、Telegram 请求与错误分类 |
+| `catalog/` | 强类型配置、文件读取隔离、材料校验、热更与目录原子发布 |
+| `partition/` | 按 Telegram 身份划分的串行队列、容量预算和消息终态计数 |
+| `observability/` | 配置与发送指标的描述、采集和输出 |
+
+`partition/` 是本服务的机器人消费域实现。运行架构、发布顺序与停机边界见[架构说明](docs/architecture.md)。
+
+## 日志
+
+日志使用 NASA 的 `nalog` 组件，通过 `log` feature 与应用宏中的 `"log"` 交给 napp 管理。现有 `tracing` 日志共用这一输出，初始化时建立控制台输出，业务资源停止后关闭文件输出并刷盘。
+
+默认级别为 `info`，同时写控制台及 `/usr/local/logs/telegram-bots` 下的 `info.log` 和独立的 `error.log`。设置 `TELEGRAM_LOG_LEVEL=warn` 可调整级别；`TELEGRAM_LOG_PATH=/绝对路径/日志目录` 可覆盖目录，显式设置为空则只写控制台。日志目录必须可写。本项目文件策略为按天或单文件达到 100 MiB 滚动、保留 7 天；`info` 与 `error` 各自的归档容量上限为 1 GiB，不包含当前活动文件。清理随启动和滚动执行。
+
+日志配置位于引导文件的 `log` 段，调整后重启应用；外部机器人 YAML 不接受日志设置。默认路径是固定值，不随 `application.name` 改变；当前 `naml 2.0.0` 不支持可靠的嵌套占位符默认值。容器启用文件输出时需挂载 UID 10001 可写的专用目录；显式关闭文件输出后可仅使用只读根文件系统。详细配置与边界见[配置合同](docs/configuration.md)。
+
 ## 快速开始
 
-需要 Rust 1.94 或更新版本。所有产品依赖从 crates.io 解析，`Cargo.lock` 固定完整依赖图。
+支持 Linux 与 macOS，需要 Rust 1.94 或更新版本。所有产品依赖从 crates.io 解析，`Cargo.lock` 固定完整依赖图。
 
 ```sh
-cargo build --locked --release
+cargo build --locked --release --bin telegram-bots
 mkdir -p deploy-local
 cp examples/catalog-empty.yml deploy-local/telegram-bots.yml
-cp examples/application-local.yml zcf/application-local.yml
-export APP_PROFILE=local
-export TELEGRAM_CATALOG_FILE="$PWD/deploy-local/telegram-bots.yml"
+export TELEGRAM_YML="$PWD/deploy-local/telegram-bots.yml"
+export TELEGRAM_LOG_PATH="$PWD/logs"
 ./target/release/telegram-bots
 ```
+
+构建只生成 `telegram-bots`，Docker 镜像也只安装这个程序。准备好上述配置与环境变量后，开发环境可直接执行 `cargo run --locked`；IDE 设置同一 `TELEGRAM_YML` 绝对路径及 `TELEGRAM_LOG_PATH` 可写目录，并将工作目录设为项目根目录即可。未设置 `TELEGRAM_YML` 时读取 `/etc/conf/telegram-bots.yml`；文件不存在会拒绝启动。
 
 监听地址默认为 `0.0.0.0:2060`。另一个终端访问：
 
@@ -37,7 +80,7 @@ curl --fail http://127.0.0.1:2060/readyz
 curl --fail http://127.0.0.1:2060/metrics
 ```
 
-空目录允许服务启动，但不提供业务调用凭据。`zcf/application.yml` 是引导文件；本地 profile 只声明外部文件路径，不存放机器人目录。镜像始终使用不可变的引导文件和 `/etc/conf/telegram-bots.yml`，具体操作见[容器部署](docs/container-deployment.md)。
+空目录允许服务启动，但不提供业务调用凭据。`zcf/application.yml` 是引导文件，外部目录路径通过 `TELEGRAM_YML` 在启动时选择。镜像使用不可变的引导文件，外部目录默认 `/etc/conf/telegram-bots.yml`，具体操作见[容器部署](docs/container-deployment.md)。
 
 ## 配置一个机器人
 
@@ -49,7 +92,7 @@ curl --fail http://127.0.0.1:2060/metrics
 4. 本地运行时将两个 `secrets.*.file` 改为真实绝对路径；容器内使用 `/run/secrets/...`。填写调用方 `allowed_bots`。
 5. 将 `generation` 改为大于当前已应用代号且不超过 `9007199254740991` 的正整数；从空目录开始时使用 `2`。先写同目录临时文件，再原子重命名为 `telegram-bots.yml`。
 
-不需要修改镜像内文件。默认每秒重新读取完整来源，连续两轮一致才发布。进程正常调度且本地文件读取较快时，稳定变更通常约 1–2 秒生效，另加读取与校验耗时。文件落地后超过 10 秒仍未生效应检查配置状态；这不是保证生效的硬上限。启动和运行期都在辅助进程内读取，默认 3 秒超时后终止并回收，再继续轮询；回收最多额外等待 1 秒。运行期读取超时保留旧目录，启动超时拒绝监听并退出；无法回收时服务失败停机。平台投射延迟或材料尚未匹配会延长等待。
+不需要修改镜像内文件。默认每秒重新读取完整来源，连续两轮一致才发布。进程正常调度且本地文件读取较快时，稳定变更通常约 1–2 秒生效，另加读取与校验耗时。文件落地后超过 10 秒仍未生效应检查配置状态；这不是保证生效的硬上限。外部目录与凭据在启动和运行期都由辅助进程读取，默认 3 秒超时后终止并回收，再继续轮询；回收最多额外等待 1 秒。运行期读取超时保留旧目录，启动超时拒绝监听并退出；无法回收时服务失败停机。平台投射延迟或材料尚未匹配会延长等待。
 
 详细字段、合并顺序、材料一致性和导入限制见[配置合同](docs/configuration.md)。
 

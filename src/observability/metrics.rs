@@ -1,8 +1,56 @@
-use crate::runtime::TelegramService;
+use crate::catalog::TelegramService;
 use nasa::application::{
     LegacyMetricsSource, MetricDescriptor, MetricKind, MetricSample, MetricValue,
 };
-use std::{fmt::Write, sync::atomic::Ordering};
+use std::{
+    fmt::Write,
+    sync::{atomic::Ordering, Arc, RwLock, Weak},
+};
+
+/// 指标目录在 UserHook 固定，弱引用避免观测出口延长业务凭据的生命周期。
+#[derive(Default)]
+pub(crate) struct CatalogMetrics(RwLock<Weak<TelegramService>>);
+
+impl CatalogMetrics {
+    /// 业务作用：初始化成功后把发送资源接入已注册的指标目录。
+    /// 参数说明：`service` 是由 napp 持有生命周期的目录资源。
+    /// 返回：后续采集可读取服务状态，不取得资源所有权。
+    pub(crate) fn bind(&self, service: &Arc<TelegramService>) {
+        *self.0.write().unwrap_or_else(|p| p.into_inner()) = Arc::downgrade(service);
+    }
+}
+
+impl LegacyMetricsSource for CatalogMetrics {
+    /// 业务作用：在资源初始化前固定发送与配置指标合同。
+    /// 参数说明：无。
+    /// 返回：不包含凭据或部署代号标签的稳定描述符。
+    fn descriptors(&self) -> &'static [&'static MetricDescriptor] {
+        &DESCRIPTORS
+    }
+
+    /// 业务作用：只从仍存活的受管目录采集观测样本。
+    /// 参数说明：无。
+    /// 返回：初始化前或清理后返回空样本；资源存在时返回完整快照。
+    fn snapshot(&self) -> Option<Vec<MetricSample>> {
+        Some(
+            self.0
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .upgrade()
+                .and_then(|service| LegacyMetricsSource::snapshot(service.as_ref()))
+                .unwrap_or_default(),
+        )
+    }
+
+    /// 业务作用：为文本出口读取仍存活目录的同一组指标。
+    /// 参数说明：`output` 是共享文本缓冲。
+    /// 返回：资源存在时追加样本；清理后不输出过期状态。
+    fn render_prometheus(&self, output: &mut String) {
+        if let Some(service) = self.0.read().unwrap_or_else(|p| p.into_inner()).upgrade() {
+            service.render_prometheus(output);
+        }
+    }
+}
 
 macro_rules! descriptor {
     ($id:ident, $name:literal, $help:literal, $kind:ident, $labels:expr) => {

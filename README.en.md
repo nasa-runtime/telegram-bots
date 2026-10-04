@@ -4,7 +4,7 @@
 
 A multi-bot Telegram text notification gateway for backend services. Callers select bot and destination aliases; the gateway owns Telegram tokens, chat identities and caller permissions. An external YAML catalog and credential files support adding and removing bots, rotating credentials and changing authorization without rebuilding the image or restarting the process.
 
-Built on crates.io `nasa 2.0.1`, the service provides bounded in-memory queues, one serial consumer per Telegram identity, a global outbound concurrency limit, atomic catalog publication and bounded draining. **HTTP 202 confirms in-memory acceptance only.** It does not confirm Telegram delivery or that a user has read a message.
+Built on crates.io `nasa 2.0.1`, the service uses `#[nasa::application("log", "web", "nacos-discovery")]` so napp owns startup, business initialization, readiness and shutdown. It provides bounded in-memory queues, one serial consumer per Telegram identity, a global outbound concurrency limit, atomic catalog publication and bounded draining. **HTTP 202 confirms in-memory acceptance only.** It does not confirm Telegram delivery or that a user has read a message.
 
 ## Capabilities and limits
 
@@ -16,23 +16,66 @@ Built on crates.io `nasa 2.0.1`, the service provides bounded in-memory queues, 
 
 Only text `sendMessage` is supported. There is no persistence, result lookup, automatic retry, idempotency store, inbound Telegram webhook, leader election or cross-instance deduplication. Run one active instance for each Telegram identity; stop the old instance before replacing its image.
 
+## Application lifecycle
+
+The entry point declares framework components and registers the `telegram-catalog` hosted initializer. napp owns the runtime, signals, Web routes, probes, metrics and optional Nacos registration. Initialization validates the external catalog and credentials, registers managed resources and stages the catalog manager as a critical task. Consumers start only after all initialization and component Ready actions succeed. Initialization failure prevents listening. napp handles SIGTERM/SIGINT during both initialization and runtime, returning a successful exit status after normal cleanup. An unexpected manager exit revokes admission and triggers application shutdown.
+
+The macro supplies `app` for business lifecycle registration:
+
+```rust
+/// 业务作用：把通知目录生命周期交给 napp。
+/// 参数说明：`app` 是尚未开放业务入口的应用容器。
+/// 返回：登记成功后继续初始化，目录不可用时拒绝启动。
+#[nasa::application("log", "web", "nacos-discovery")]
+async fn main(app: nasa::Application) -> anyhow::Result<()> {
+    telegram_bots::application::install(&app)?;
+    Ok(())
+}
+```
+
+The service has one executable. Each read cycle forks a child that returns file bytes over an anonymous channel; the parent merges and validates documents in memory. The child does not restart napp, Nacos or HTTP services. A managed cleanup action retains ownership of startup readers even when initialization is cancelled. napp synchronously reads `zcf/application.yml` and the active profile before business initialization: keep these immutable files on reliable local storage. Their first read is outside `catalog_watch.load_timeout_ms`; external catalog and credential file reads have timeout and process-reaping protection.
+
+## Source layout
+
+Only the application entry `main.rs` and library module entry `lib.rs` remain directly under `src/`. Business code is grouped by responsibility:
+
+| Directory | Responsibility |
+| --- | --- |
+| `rest/` | REST authentication, bot discovery, message submission and configuration status endpoints |
+| `application/` | Registration of initialization, readiness, critical tasks and managed cleanup through app |
+| `service/` | Caller permissions, destination selection, message acceptance, Telegram requests and error classification |
+| `catalog/` | Typed configuration, isolated file reads, credential validation, reloads and atomic publication |
+| `partition/` | Serial queues per Telegram identity, capacity budgets and terminal message accounting |
+| `observability/` | Configuration and delivery metric definitions, collection and output |
+
+`partition/` implements this service's bot consumer domains. See the [architecture](docs/architecture.md) for publication ordering and shutdown boundaries.
+
+## Logging
+
+NASA's `nalog` component is enabled through the `log` feature and `"log"` in the application macro. napp owns initialization and flushes file output after business resources stop. Existing `tracing` events use the same output.
+
+The default is `info` level with console output plus `info.log` and a separate `error.log` under `/usr/local/logs/telegram-bots`. Set `TELEGRAM_LOG_LEVEL=warn` to change the level, or `TELEGRAM_LOG_PATH=/absolute/log/directory` to change the directory. An explicitly empty `TELEGRAM_LOG_PATH` selects console output only. The log directory must be writable. This service rotates files daily or at 100 MiB, retains archives for seven days and limits each of the `info` and `error` archive sets to 1 GiB. Active files are excluded from those caps; cleanup runs at startup and rotation.
+
+Logging belongs to the bootstrap `log` section and should be changed with an application restart. External bot catalogs cannot configure logging. The default path is fixed and does not follow changes to `application.name`; the current `naml 2.0.0` dependency cannot reliably resolve nested placeholder defaults. File output requires a dedicated writable mount for UID 10001 in containers. Explicitly disabling file output allows a read-only root without a log volume. See the [configuration reference](docs/configuration.md).
+
 ## Start locally
 
-Rust 1.94 or newer is required. Product dependencies resolve from crates.io; commit and retain `Cargo.lock` when building the service.
+Linux and macOS are supported, with Rust 1.94 or newer. Product dependencies resolve from crates.io; commit and retain `Cargo.lock` when building the service.
 
 ```sh
-cargo build --locked --release
+cargo build --locked --release --bin telegram-bots
 mkdir -p deploy-local
 cp examples/catalog-empty.yml deploy-local/telegram-bots.yml
-cp examples/application-local.yml zcf/application-local.yml
-export APP_PROFILE=local
-export TELEGRAM_CATALOG_FILE="$PWD/deploy-local/telegram-bots.yml"
+export TELEGRAM_YML="$PWD/deploy-local/telegram-bots.yml"
+export TELEGRAM_LOG_PATH="$PWD/logs"
 ./target/release/telegram-bots
 ```
 
+The build produces only `telegram-bots`, which is also the only application executable installed in the Docker image. After preparing the configuration and environment variables above, use `cargo run --locked` for development. Configure the same absolute `TELEGRAM_YML` path and a writable `TELEGRAM_LOG_PATH` directory in your IDE, and use the project root as its working directory. Without `TELEGRAM_YML`, the service reads `/etc/conf/telegram-bots.yml`; a missing file prevents startup.
+
 The default listener is `0.0.0.0:2060`. Check `/readyz` and `/metrics` from an internal network. An empty catalog can start, but has no authenticated business callers.
 
-The image retains its immutable `/app/zcf/application.yml` bootstrap and reads `/etc/conf/telegram-bots.yml`. Mount configuration and credentials as directories, not individual files. See [container deployment](docs/container-deployment.md) for Docker and Kubernetes, including non-root operation and read-only mounts.
+The image retains its immutable `/app/zcf/application.yml` bootstrap and reads `/etc/conf/telegram-bots.yml` by default. `TELEGRAM_YML` can select another absolute path at startup. Mount configuration and credentials as directories, not individual files. See [container deployment](docs/container-deployment.md) for Docker and Kubernetes, including non-root operation and read-only mounts.
 
 ## Configure a bot
 
@@ -42,7 +85,7 @@ Calculate SHA-256 over the original file bytes, including any trailing newline, 
 
 Set `generation` to an integer in `1..=9007199254740991`, greater than the applied generation; use `2` when replacing the starter empty catalog. Write the complete next file and atomically rename it into place. All imported files must declare the same generation. Restoring old business content also requires a new, higher generation. The generation floor is not persisted across process restarts.
 
-The default poll interval is one second. Publication requires two consecutive matching complete reads. With normal scheduling and fast local file reads, a stable change usually takes about one to two seconds to apply, plus reading and validation time. Check the configuration status if a stable visible change remains unapplied after ten seconds; this is an operational threshold, not a guaranteed maximum delay. Startup and runtime reads execute in a separate helper process. The default read budget is three seconds, followed by at most one second to terminate and reap the helper. Runtime timeouts retain the working catalog and subsequent polls retry; startup timeouts exit without opening the listener. Failure to reap the helper stops the service. Platform projection delays or mismatched credentials can extend the wait.
+The default poll interval is one second. Publication requires two consecutive matching complete reads. With normal scheduling and fast local file reads, a stable change usually takes about one to two seconds to apply, plus reading and validation time. Check the configuration status if a stable visible change remains unapplied after ten seconds; this is an operational threshold, not a guaranteed maximum delay. External catalog and credential reads execute in a separate helper process during both initialization and runtime. The default read budget is three seconds, followed by at most one second to terminate and reap the helper. Runtime timeouts retain the working catalog and subsequent polls retry; startup timeouts exit without opening the listener. Failure to reap the helper stops the service. Platform projection delays or mismatched credentials can extend the wait.
 
 Imports are explicit lists of absolute `file` paths with an explicit `optional` flag. Glob expressions such as `/etc/conf/*.yml`, recursive imports and inline secret material are unsupported. Unknown fields fail closed. See the [configuration reference](docs/configuration.md) for all fields, precedence and limits.
 

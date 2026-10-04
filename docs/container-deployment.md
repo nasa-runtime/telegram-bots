@@ -10,6 +10,7 @@ mkdir -p deploy-local/config deploy-local/secrets
 cp examples/catalog-empty.yml deploy-local/config/telegram-bots.yml
 docker run --detach --name telegram-bots \
   --read-only --cap-drop ALL --security-opt no-new-privileges \
+  --env TELEGRAM_LOG_PATH= \
   --publish 127.0.0.1:2060:2060 \
   --mount "type=bind,src=$PWD/deploy-local/config,dst=/etc/conf,readonly" \
   --mount "type=bind,src=$PWD/deploy-local/secrets,dst=/run/secrets,readonly" \
@@ -23,6 +24,8 @@ docker run --detach --name telegram-bots \
 基于 [catalog.yml](../examples/catalog.yml) 生成业务目录并填入真实目的地和凭据文件摘要；将 `generation` 增加到 `2`，通过同目录重命名替换 `/etc/conf/telegram-bots.yml`。以后每次变更递增代号。更新凭据文件时同时更新 YAML 摘要；过渡期目录会被拒绝，旧目录继续服务，匹配后自动应用。
 
 根文件系统可以只读，无需持久化消息数据卷。镜像不默认配置 Docker HEALTHCHECK；容器平台可以使用 HTTP 探针。源码镜像构建者负责固定基础镜像 digest、漏洞管理、SBOM 和来源记录。
+
+nalog 默认同时输出到控制台和 `/usr/local/logs/telegram-bots`。上面的命令显式将 `TELEGRAM_LOG_PATH` 设为空，交由平台采集标准输出。使用默认文件日志时，移除该环境变量，并另挂载 UID/GID `10001:10001` 可写的专用目录到 `/usr/local/logs/telegram-bots`。也可设置 `TELEGRAM_LOG_PATH` 选择其它挂载路径。该日志卷必须可写；配置与凭据卷仍保持只读。只读根目录下启用文件日志但未提供可写挂载会导致启动失败。`TELEGRAM_LOG_LEVEL` 控制启动日志级别，默认 `info`。
 
 ```sh
 docker stop --time 70 telegram-bots
@@ -60,6 +63,8 @@ spec:
       containers:
         - name: telegram-bots
           image: YOUR_REGISTRY/telegram-bots:YOUR_IMAGE_TAG
+          env:
+            - {name: TELEGRAM_LOG_PATH, value: ""}
           securityContext:
             readOnlyRootFilesystem: true
             allowPrivilegeEscalation: false
