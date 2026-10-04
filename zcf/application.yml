@@ -1,0 +1,28 @@
+application:
+  name: telegram-bots
+  mode: service
+  startup_timeout_ms: 30000
+  shutdown_timeout_ms: 60000
+
+server:
+  host: 0.0.0.0
+  port: 2060
+  health: true
+  request_body_limit_bytes: 65536
+  max_inflight_requests: 256
+  graceful_shutdown_timeout_ms: 3000
+
+rest_discovery:
+  enabled: false
+
+yml:
+  imports:
+    - file: /etc/conf/telegram-bots.yml
+      optional: false
+
+config_watch:
+  enabled: true
+
+catalog_watch:
+  poll_interval_ms: 1000
+  load_timeout_ms: 3000

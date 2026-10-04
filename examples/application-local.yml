@@ -1,0 +1,4 @@
+yml:
+  imports:
+    - file: ${TELEGRAM_CATALOG_FILE}
+      optional: false

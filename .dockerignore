@@ -1,0 +1,10 @@
+**
+!Cargo.toml
+!Cargo.lock
+!src
+!src/**
+!zcf
+!zcf/application.yml
+!zcf/application-nacos.yml
+!LICENSE-MIT
+!LICENSE-APACHE

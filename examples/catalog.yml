@@ -1,0 +1,36 @@
+generation: 1
+telegram:
+  http:
+    api_base: https://api.telegram.org
+    connect_timeout_ms: 3000
+    request_timeout_ms: 10000
+    body_read_timeout_ms: 5000
+    max_response_bytes: 65536
+    max_body_bytes: 65536
+    max_inflight: 64
+  dispatcher:
+    shutdown_timeout_ms: 20000
+  bots:
+    ops:
+      description: 运维告警通知
+      token: secret://ops_bot
+      default_destination: alerts
+      destinations:
+        alerts:
+          chat_id: -1000000000000
+      delivery:
+        queue_capacity: 256
+        min_interval_ms: 3100
+        disable_notification: false
+        protect_content: false
+  clients:
+    monitoring:
+      credential: secret://monitoring
+      allowed_bots: [ops]
+secrets:
+  ops_bot:
+    file: /run/secrets/ops_bot
+    sha256: REPLACE_WITH_64_HEX_SHA256
+  monitoring:
+    file: /run/secrets/monitoring
+    sha256: REPLACE_WITH_64_HEX_SHA256

@@ -1,0 +1,33 @@
+name: Rust
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      matrix:
+        toolchain: ["1.94.0", stable]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Install Rust
+        run: rustup toolchain install ${{ matrix.toolchain }} --profile minimal --component rustfmt --component clippy
+      - name: Format
+        run: cargo +${{ matrix.toolchain }} fmt --all --check
+      - name: Lint
+        run: cargo +${{ matrix.toolchain }} clippy --all-targets --locked -- -D warnings
+      - name: Build
+        run: cargo +${{ matrix.toolchain }} build --locked
+      - name: Documentation
+        run: cargo +${{ matrix.toolchain }} doc --locked --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - name: Source archive
+        run: cargo +${{ matrix.toolchain }} package --locked

@@ -1,0 +1,11 @@
+/target/
+/tests/
+/logs/
+/zcf/application-local.yml
+/deploy-local/
+/.claude/
+/.cc-writes/
+*.secret
+.env
+.env.*
+.DS_Store
