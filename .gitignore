@@ -3,6 +3,7 @@
 /logs/
 /zcf/application-local.yml
 /deploy-local/
+/.idea/
 /.claude/
 /.cc-writes/
 *.secret
