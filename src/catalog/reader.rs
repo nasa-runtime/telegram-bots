@@ -40,6 +40,7 @@ impl ReadProcess {
 pub(crate) struct FileReader {
     pid: Option<libc::pid_t>,
     stream: tokio::net::UnixStream,
+    identity: Option<(u64, u64)>,
 }
 
 impl FileReader {
@@ -74,6 +75,7 @@ impl FileReader {
         Ok(Self {
             pid: Some(pid),
             stream,
+            identity: None,
         })
     }
 
@@ -87,6 +89,50 @@ impl FileReader {
         optional: bool,
         probe: bool,
     ) -> Result<Option<Zeroizing<Vec<u8>>>> {
+        self.request(path, limit, optional, probe, false).await
+    }
+
+    /// 业务作用：在可终止进程内枚举单层目录，文件名不会交给 shell 解释。
+    /// 参数说明：`path` 是固定目录；`optional` 只允许目录不存在。
+    /// 返回：最多 4096 个 UTF-8 文件名；权限、类型、编码与规模错误拒绝整轮。
+    pub(crate) async fn list(&mut self, path: &str, optional: bool) -> Result<Vec<String>> {
+        let Some(bytes) = self.request(path, MAX_FILE, optional, false, true).await? else {
+            return Ok(Vec::new());
+        };
+        let mut names = Vec::new();
+        for name in bytes
+            .split(|byte| *byte == 0)
+            .filter(|name| !name.is_empty())
+        {
+            ensure!(names.len() < 4096, "配置目录条目超过上限");
+            names.push(
+                std::str::from_utf8(name)
+                    .map_err(|_| anyhow!("配置目录文件名必须为 UTF-8"))?
+                    .to_owned(),
+            );
+        }
+        Ok(names)
+    }
+
+    /// 业务作用：返回最近一次成功读取的文件身份，识别别名和硬链接重复来源。
+    /// 参数说明：无。
+    /// 返回：设备与 inode；缺失或拒绝后没有有效身份。
+    pub(crate) fn identity(&self) -> Option<(u64, u64)> {
+        self.identity
+    }
+
+    /// 业务作用：通过有界协议请求文件或目录读取，不在业务进程执行文件系统遍历。
+    /// 参数说明：`path/limit/optional/probe` 固定来源约束；`directory` 选择单层目录读取。
+    /// 返回：完整有界响应或安全错误，失败后没有残留来源身份。
+    async fn request(
+        &mut self,
+        path: &str,
+        limit: usize,
+        optional: bool,
+        probe: bool,
+        directory: bool,
+    ) -> Result<Option<Zeroizing<Vec<u8>>>> {
+        self.identity = None;
         ensure!(
             !path.is_empty()
                 && path.len() <= MAX_PATH
@@ -99,7 +145,7 @@ impl FileReader {
             .await
             .map_err(|_| anyhow!("配置读取通道失败"))?;
         self.stream
-            .write_u32(limit as u32)
+            .write_u32(limit as u32 | if directory { 1 << 31 } else { 0 })
             .await
             .map_err(|_| anyhow!("配置读取通道失败"))?;
         self.stream
@@ -119,6 +165,17 @@ impl FileReader {
         match status {
             0 => {
                 ensure!(size <= limit, "配置读取响应超过上限");
+                let device = self
+                    .stream
+                    .read_u64()
+                    .await
+                    .map_err(|_| anyhow!("来源身份响应不完整"))?;
+                let inode = self
+                    .stream
+                    .read_u64()
+                    .await
+                    .map_err(|_| anyhow!("来源身份响应不完整"))?;
+                self.identity = Some((device, inode));
                 let mut bytes = Zeroizing::new(vec![0; size]);
                 self.stream
                     .read_exact(&mut bytes)
@@ -298,7 +355,9 @@ unsafe fn read_loop(socket: RawFd, buffer: *mut u8, fd_limit: i32, parent: libc:
             libc::_exit(0);
         }
         let length = u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize;
-        let limit = u32::from_be_bytes([header[4], header[5], header[6], header[7]]) as usize;
+        let request = u32::from_be_bytes([header[4], header[5], header[6], header[7]]);
+        let directory = request & (1 << 31) != 0;
+        let limit = (request & !(1 << 31)) as usize;
         if length == 0 || length > MAX_PATH || limit > MAX_FILE {
             libc::_exit(1);
         }
@@ -309,12 +368,26 @@ unsafe fn read_loop(socket: RawFd, buffer: *mut u8, fd_limit: i32, parent: libc:
         let fd = libc::open(path.as_ptr().cast(), libc::O_RDONLY | libc::O_NONBLOCK);
         let mut status = 0u32;
         let mut size = 0usize;
+        let mut device = 0u64;
+        let mut inode = 0u64;
         if fd < 0 {
-            status = if os_error() == libc::ENOENT { 1 } else { 4 };
+            status = if os_error() == libc::ENOENT && absent_path(path.as_mut_ptr(), length) {
+                1
+            } else {
+                4
+            };
         } else {
             let mut metadata: libc::stat = std::mem::zeroed();
             if libc::fstat(fd, &mut metadata) != 0 {
                 status = 4;
+            } else if directory {
+                if metadata.st_mode & libc::S_IFMT != libc::S_IFDIR {
+                    status = 2;
+                } else {
+                    let result = directory_bytes(fd, buffer, limit);
+                    status = result.0;
+                    size = result.1;
+                }
             } else if metadata.st_mode & libc::S_IFMT != libc::S_IFREG {
                 status = 2;
             } else {
@@ -339,6 +412,24 @@ unsafe fn read_loop(socket: RawFd, buffer: *mut u8, fd_limit: i32, parent: libc:
                     status = 3;
                 }
             }
+            if status == 0 {
+                let mut after: libc::stat = std::mem::zeroed();
+                if libc::fstat(fd, &mut after) != 0
+                    || metadata.st_dev != after.st_dev
+                    || metadata.st_ino != after.st_ino
+                    || metadata.st_size != after.st_size
+                    || metadata.st_mtime != after.st_mtime
+                    || metadata.st_mtime_nsec != after.st_mtime_nsec
+                {
+                    status = 4;
+                }
+                // 系统字段宽度随平台变化；通道统一传输 64 位身份，不能截断去重证据。
+                #[allow(clippy::unnecessary_cast)]
+                {
+                    device = metadata.st_dev as u64;
+                    inode = metadata.st_ino as u64;
+                }
+            }
             libc::close(fd);
         }
         if status != 0 {
@@ -348,6 +439,9 @@ unsafe fn read_loop(socket: RawFd, buffer: *mut u8, fd_limit: i32, parent: libc:
         let mut count = (size as u32).to_be_bytes();
         if !transfer(3, code.as_mut_ptr(), 4, true)
             || !transfer(3, count.as_mut_ptr(), 4, true)
+            || (status == 0
+                && (!transfer(3, device.to_be_bytes().as_mut_ptr(), 8, true)
+                    || !transfer(3, inode.to_be_bytes().as_mut_ptr(), 8, true)))
             || !transfer(3, buffer, size, true)
         {
             libc::_exit(1);
@@ -389,4 +483,113 @@ unsafe fn os_error() -> i32 {
     {
         *libc::__error()
     }
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    /// 业务作用：直接读取 macOS 目录记录，避免 fork 后触发用户态分配器或目录锁。
+    /// 参数说明：`fd` 为目录句柄；`buffer/size` 指定可写缓冲；`base` 接收目录位置。
+    /// 返回：已写字节数、目录结束时的零或失败时的负值，错误由 errno 提供。
+    fn __getdirentries64(
+        fd: libc::c_int,
+        buffer: *mut libc::c_char,
+        size: libc::size_t,
+        base: *mut libc::off_t,
+    ) -> libc::ssize_t;
+}
+
+/// 业务作用：通过内核目录读取接口取得文件名，fork 后不调用带分配器或锁的目录库。
+/// 参数说明：`fd` 是已确认的目录；`output` 为预分配缓冲；`limit` 是输出字节上限。
+/// 返回：协议状态和 NUL 分隔名称字节数；结构异常或超过条目预算立即拒绝。
+/// 安全边界：输出缓冲至少 limit 字节；目录记录只在校验范围内使用未对齐读取。
+unsafe fn directory_bytes(fd: RawFd, output: *mut u8, limit: usize) -> (u32, usize) {
+    let mut scratch = [0u8; 16384];
+    let mut size = 0usize;
+    let mut entries = 0usize;
+    #[cfg(target_os = "macos")]
+    let mut base: libc::off_t = 0;
+    loop {
+        #[cfg(target_os = "macos")]
+        let count = __getdirentries64(fd, scratch.as_mut_ptr().cast(), scratch.len(), &mut base);
+        #[cfg(target_os = "linux")]
+        let count = libc::syscall(
+            libc::SYS_getdents64,
+            fd,
+            scratch.as_mut_ptr(),
+            scratch.len(),
+        ) as libc::ssize_t;
+        if count < 0 && os_error() == libc::EINTR {
+            continue;
+        }
+        if count < 0 {
+            return (4, 0);
+        }
+        if count == 0 {
+            return (0, size);
+        }
+        if count as usize > scratch.len() {
+            return (4, 0);
+        }
+        let mut offset = 0usize;
+        while offset < count as usize {
+            #[cfg(target_os = "macos")]
+            let name_offset = 21usize;
+            #[cfg(target_os = "linux")]
+            let name_offset = 19usize;
+            if (count as usize) - offset <= name_offset {
+                return (4, 0);
+            }
+            let record = scratch.as_ptr().add(offset);
+            let length = std::ptr::read_unaligned(record.add(16).cast::<u16>()) as usize;
+            if length <= name_offset || length > count as usize - offset {
+                return (4, 0);
+            }
+            let mut name_length = 0usize;
+            while name_offset + name_length < length && *record.add(name_offset + name_length) != 0
+            {
+                name_length += 1;
+            }
+            if name_length == 0 || name_offset + name_length >= length {
+                return (4, 0);
+            }
+            let name = record.add(name_offset);
+            let dot = name_length == 1 && *name == b'.';
+            let parent = name_length == 2 && *name == b'.' && *name.add(1) == b'.';
+            if !dot && !parent && std::ptr::read_unaligned(record.cast::<u64>()) != 0 {
+                entries += 1;
+                if entries > 4096 || name_length + 1 > limit.saturating_sub(size) {
+                    return (3, 0);
+                }
+                std::ptr::copy_nonoverlapping(name, output.add(size), name_length);
+                *output.add(size + name_length) = 0;
+                size += name_length + 1;
+            }
+            offset += length;
+        }
+    }
+}
+
+/// 业务作用：区分来源不存在与悬空链接，optional 不能吞掉链接损坏。
+/// 参数说明：`path` 是可写且以 NUL 结束的路径缓冲；`length` 不含末尾 NUL。
+/// 返回：只在缺失且所有已有链接可解析时为真；仅调用无分配的系统接口。
+/// 安全边界：缓冲至少 length + 1 字节，临时分隔符在每轮检查后恢复。
+unsafe fn absent_path(path: *mut u8, length: usize) -> bool {
+    for index in 1..=length {
+        if index != length && *path.add(index) != b'/' {
+            continue;
+        }
+        let saved = *path.add(index);
+        *path.add(index) = 0;
+        let mut metadata: libc::stat = std::mem::zeroed();
+        let result = libc::lstat(path.cast(), &mut metadata);
+        let error = if result < 0 { os_error() } else { 0 };
+        let broken = result == 0
+            && metadata.st_mode & libc::S_IFMT == libc::S_IFLNK
+            && libc::stat(path.cast(), &mut metadata) != 0;
+        *path.add(index) = saved;
+        if broken || (result < 0 && error != libc::ENOENT) {
+            return false;
+        }
+    }
+    true
 }

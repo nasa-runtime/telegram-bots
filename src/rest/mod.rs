@@ -3,3 +3,6 @@
 mod auth;
 mod bots;
 mod config;
+mod response;
+
+pub(crate) use response::install;

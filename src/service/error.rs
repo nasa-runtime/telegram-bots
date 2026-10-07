@@ -1,11 +1,14 @@
 use http::header;
+use nasa::base::BaseResponse;
 use nasa::web::{IntoResponse, Json, Response, StatusCode};
 use serde::Serialize;
 
 /// 有限错误合同；绝不携带上游 URL、token、消息正文或响应原文。
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct ApiError {
+    #[serde(rename = "reason")]
     pub code: &'static str,
+    #[serde(skip)]
     pub message: &'static str,
     pub delivery: &'static str,
     pub retry_safe: bool,
@@ -17,7 +20,7 @@ pub struct ApiError {
 
 impl ApiError {
     /// 业务作用：描述尚未触发 Telegram 发送的拒绝结果。
-    /// 参数说明：`status`、`code`、`message` 是稳定 HTTP 状态、原因与说明。
+    /// 参数说明：`status` 提供 JSON 数字处理码，`code`、`message` 是稳定原因与说明。
     /// 返回：delivery=not_sent；容量不足或服务暂不可用时允许稍后重试。
     pub fn not_sent(status: StatusCode, code: &'static str, message: &'static str) -> Self {
         Self {
@@ -33,7 +36,7 @@ impl ApiError {
 
     /// 业务作用：保守表达请求发出后无法确认结果的状态，防止调用方自动重复通知。
     /// 参数说明：`timeout` 表示是否因总期限耗尽退出。
-    /// 返回：HTTP 504 或 502，delivery=unknown 且 retry_safe=false。
+    /// 返回：处理码为 504 或 502，delivery=unknown 且 retry_safe=false。
     pub fn unknown(timeout: bool) -> Self {
         Self {
             code: if timeout {
@@ -94,11 +97,19 @@ impl ApiError {
 impl IntoResponse for ApiError {
     /// 业务作用：统一返回机器可读错误和可选重试等待信息。
     /// 参数说明：无。
-    /// 返回：固定 JSON 错误信封；鉴权失败携带 Bearer challenge。
+    /// 返回：HTTP 200，BaseResponse.code 表达处理结果，msg 提供固定摘要，data 保留发送与重试语义。
     fn into_response(self) -> Response {
         let retry_after = self.retry_after_seconds;
         let status = self.status;
-        let mut response = (status, Json(serde_json::json!({"error": self}))).into_response();
+        let mut envelope = BaseResponse::err(i32::from(status.as_u16()), self.message);
+        envelope.data = Some(self.clone());
+        let mut response = Json(envelope).into_response();
+        response.extensions_mut().insert(self);
+        // HTTP 200 不能让代理缓存认证拒绝或过载结果，避免跨调用方复用处理状态。
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            header::HeaderValue::from_static("no-store"),
+        );
         if let Some(seconds) = retry_after {
             if let Ok(value) = seconds.to_string().parse() {
                 response.headers_mut().insert(header::RETRY_AFTER, value);

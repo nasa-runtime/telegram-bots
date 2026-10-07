@@ -1,9 +1,11 @@
 use std::sync::Arc;
 
+use nasa::base::BaseResponse;
 use nasa::web::{get_mapping, Extension, Json};
 use telegram_bots::catalog::{CatalogStatus, TelegramService};
 
 use super::auth::authenticate;
+use super::response::success;
 
 /// 业务作用：让授权调用方查看目录部署、拒绝原因与机器人排空状态。
 /// 参数说明：`service` 是受管目录资源。
@@ -13,6 +15,8 @@ use super::auth::authenticate;
     auth = "required",
     interceptors(authenticate)
 )]
-async fn config_status(Extension(service): Extension<Arc<TelegramService>>) -> Json<CatalogStatus> {
-    Json(service.observation())
+async fn config_status(
+    Extension(service): Extension<Arc<TelegramService>>,
+) -> Json<BaseResponse<CatalogStatus>> {
+    success(service.observation())
 }

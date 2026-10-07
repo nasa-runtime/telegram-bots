@@ -213,7 +213,7 @@ impl Catalog {
 
     /// 业务作用：在解析消息和查询机器人前认证调用方。
     /// 参数说明：`headers` 必须包含唯一 X-Client-Id 与 Authorization: Bearer 凭据。
-    /// 返回：认证成功返回本代权限；身份或凭据无效统一返回 401。
+    /// 返回：认证成功返回本代权限；身份或凭据无效返回处理码 401。
     pub fn authenticate(&self, headers: &HeaderMap) -> Result<Arc<Caller>, ApiError> {
         let denied = || {
             ApiError::not_sent(

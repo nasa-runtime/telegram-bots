@@ -1,6 +1,6 @@
 [package]
 name = "telegram-bots"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 rust-version = "1.94"
 publish = false
@@ -8,19 +8,19 @@ autotests = false
 description = "Telegram notification gateway with atomic catalog reloads, bounded queues and per-bot ordering"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
-include = ["Cargo.toml", "Cargo.lock", "README*.md", "SECURITY.md", "CONTRIBUTING.md", "LICENSE-*", "docs/**", "examples/**", "Dockerfile", ".dockerignore", "src/**", "zcf/application.yml", "zcf/application-nacos.yml"]
+repository = "https://github.com/nasa-runtime/telegram-bots"
+include = ["/Cargo.toml", "/Cargo.lock", "/README*.md", "/SECURITY.md", "/CONTRIBUTING.md", "/LICENSE-*", "/docs/**", "/examples/**", "/.dockerignore", "/src/**", "/zcf/application.yml", "/zcf/application-nacos.yml"]
 
 [dependencies]
 anyhow = "1"
-config = { version = "0.15.25", default-features = false, features = ["yaml", "json", "toml"] }
+futures-util = "0.3"
 http = "1"
 http-body-util = "0.1"
-nasa = { version = "2.0.1", features = ["application", "log", "yml-watch", "web-auth", "nacos-discovery", "nacos-sdk"] }
+nasa = { version = "2.0.2", features = ["application", "base", "log", "yml-watch", "web-auth", "nacos-discovery", "nacos-sdk"] }
 libc = "0.2"
 reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serde_yaml = "0.9"
 sha2 = "0.10"
 subtle = "2"
 tokio = { version = "1", features = ["sync", "time", "rt", "net", "io-util"] }

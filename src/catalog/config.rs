@@ -176,7 +176,7 @@ impl TelegramConfig {
     /// 返回：全表结构和约束有效时返回配置；错误只包含固定摘要，不回显输入值。
     pub fn parse(value: Value) -> Result<Self> {
         reject_null(&value)?;
-        let config: Self = serde_json::from_value(value)
+        let config: Self = nasa::yml::strict::bind(value)
             .map_err(|_| anyhow::anyhow!("telegram 配置结构无效：请检查必填项、类型和未知字段"))?;
         config.validate()?;
         Ok(config)

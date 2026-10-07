@@ -24,9 +24,9 @@ flowchart LR
     Budget --> Telegram[Telegram sendMessage]
 ```
 
-入口采用 `#[nasa::application("log", "web", "nacos-discovery")]`，由宏生成 runtime、路由装配与进程入口。业务钩子只登记指标和 `telegram-catalog` hosted initializer。
+入口采用 `#[nasa::application("log", "web", "nacos-discovery", config = telegram_bots::catalog::source::bootstrap_loader)]`，由宏生成 runtime、路由装配与进程入口。配置工厂在 preflight 前固定严格解析规则和环境快照，关闭框架自动读取目录 imports，由受管读取进程负责外部 YAML。业务钩子登记统一响应与入口并发边界、指标和 `telegram-catalog` hosted initializer。
 
-1. napp 标准入口读取不可变引导文件并启动基础组件。
+1. napp 通过上述配置工厂读取不可变引导文件及活动 profile，并启动基础组件。
 2. initializer 在应用统一启动期限内调用隔离读取，确认目录与框架使用的引导快照一致，构建发送资源并登记 `TelegramHandle` 受管资源。
 3. `after` 屏障通过 `stage_critical` 暂存目录管理器。所有组件 Ready 成功后由 napp 放行任务，管理器拥有全部发送工作者的 `JoinSet`。
 4. `initializer/telegram-catalog/catalog` 就绪贡献表示完整目录已准备。普通候选拒绝保留旧目录和就绪；管理器退出立即撤销就绪与受理权，异常退出触发失败停机。
@@ -59,7 +59,7 @@ napp 同时拥有 nalog 日志、Web listener、探针、指标和可选 Nacos �
 
 ## 顺序、容量与错误
 
-每个 bot 最多串行进行一次发送；不同 bot 可以并行，受 `max_inflight` 限制。等待发送间隔和平台冷却时不占用 HTTP 许可。队列满时 REST 返回 429，不等待 Telegram 或可用位置。
+每个 bot 最多串行进行一次发送；不同 bot 可以并行，受 `max_inflight` 限制。等待发送间隔和平台冷却时不占用 HTTP 许可。业务 HTTP 响应统一为 200，JSON code 表达处理结果；队列满时 code=429，不等待 Telegram 或可用位置。入口并发预算由业务响应层持有，过载同样通过 JSON code=503 表达；健康探针不占用业务预算并保留真实 HTTP 状态。
 
 顺序只覆盖进程内按受理顺序发起请求。超时后平台仍可能迟到处理，因此不能保证异常网络下 Telegram 最终显示顺序，更不能承诺恰好一次投递。
 

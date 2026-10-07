@@ -2,19 +2,22 @@
 
 ## 镜像与挂载
 
-镜像包含二进制、CA、许可证和 `/app/zcf/` 引导文件。机器人目录和凭据从只读挂载读取，不进入镜像层。随附 Dockerfile 使用 Rust 1.94、锁文件和非 root 用户 `10001:10001`；运行目录为 `/app`。
+容器部署需要部署方自行构建并提供镜像。使用 Rust 1.94 或更新版本和仓库锁文件，为目标 Linux 架构构建 `telegram-bots`；镜像中放置 `/app/telegram-bots`、匹配的运行库、CA 证书、许可证和 `/app/zcf/` 下的引导文件。机器人目录和凭据从只读挂载读取，不进入镜像层。
+
+下面的 Docker 与 Kubernetes 示例约定运行身份为非 root 用户 `10001:10001`、运行目录为 `/app`，启动命令为 `/app/telegram-bots`。镜像构建者需要保证该用户可执行程序、读取引导文件，并按这些路径准备镜像；将示例镜像地址替换为实际地址。
 
 ```sh
-docker build --tag telegram-bots:local .
+export TELEGRAM_BOTS_IMAGE=YOUR_REGISTRY/telegram-bots:YOUR_IMAGE_TAG
 mkdir -p deploy-local/config deploy-local/secrets
 cp examples/catalog-empty.yml deploy-local/config/telegram-bots.yml
 docker run --detach --name telegram-bots \
+  --user 10001:10001 --workdir /app --entrypoint /app/telegram-bots \
   --read-only --cap-drop ALL --security-opt no-new-privileges \
   --env TELEGRAM_LOG_PATH= \
   --publish 127.0.0.1:2060:2060 \
   --mount "type=bind,src=$PWD/deploy-local/config,dst=/etc/conf,readonly" \
   --mount "type=bind,src=$PWD/deploy-local/secrets,dst=/run/secrets,readonly" \
-  telegram-bots:local
+  "$TELEGRAM_BOTS_IMAGE"
 ```
 
 配置目录需要可遍历，目录文件需要可读；凭据文件应仅允许 UID 10001 或其受控组读取。不要把 token 放入 Dockerfile、构建参数、镜像标签或普通 ConfigMap。
@@ -23,7 +26,7 @@ docker run --detach --name telegram-bots \
 
 基于 [catalog.yml](../examples/catalog.yml) 生成业务目录并填入真实目的地和凭据文件摘要；将 `generation` 增加到 `2`，通过同目录重命名替换 `/etc/conf/telegram-bots.yml`。以后每次变更递增代号。更新凭据文件时同时更新 YAML 摘要；过渡期目录会被拒绝，旧目录继续服务，匹配后自动应用。
 
-根文件系统可以只读，无需持久化消息数据卷。镜像不默认配置 Docker HEALTHCHECK；容器平台可以使用 HTTP 探针。源码镜像构建者负责固定基础镜像 digest、漏洞管理、SBOM 和来源记录。
+根文件系统可以只读，无需持久化消息数据卷。容器平台可以使用 HTTP 探针；自行添加 Docker HEALTHCHECK 时，应根据 `/readyz` 的实际 HTTP 状态判断就绪。镜像构建者负责固定基础镜像 digest、漏洞管理、SBOM 和来源记录。
 
 nalog 默认同时输出到控制台和 `/usr/local/logs/telegram-bots`。上面的命令显式将 `TELEGRAM_LOG_PATH` 设为空，交由平台采集标准输出。使用默认文件日志时，移除该环境变量，并另挂载 UID/GID `10001:10001` 可写的专用目录到 `/usr/local/logs/telegram-bots`。也可设置 `TELEGRAM_LOG_PATH` 选择其它挂载路径。该日志卷必须可写；配置与凭据卷仍保持只读。只读根目录下启用文件日志但未提供可写挂载会导致启动失败。`TELEGRAM_LOG_LEVEL` 控制启动日志级别，默认 `info`。
 
@@ -63,6 +66,8 @@ spec:
       containers:
         - name: telegram-bots
           image: YOUR_REGISTRY/telegram-bots:YOUR_IMAGE_TAG
+          workingDir: /app
+          command: ["/app/telegram-bots"]
           env:
             - {name: TELEGRAM_LOG_PATH, value: ""}
           securityContext:
@@ -128,3 +133,5 @@ spec:
 设置 `APP_PROFILE=nacos`，提供 `NACOS_SERVER_ADDR`、`TELEGRAM_REGISTER_IP`，以及环境需要的 `NACOS_NAMESPACE`、`NACOS_GROUP`、`NACOS_USERNAME`、`NACOS_PASSWORD`。注册 IP 必须能被调用方访问；Pod 中可通过 Downward API 注入 `status.podIP`。
 
 Nacos 只发布实例寻址信息。它不读取 bot YAML，不提供跨实例队列协调，也不替代 HTTP Bearer 认证。来源和 Nacos profile 在启动时固定，调整它们需要重启。
+
+默认来源模式为 `/etc/conf/telegram*.yml`，单文件部署继续使用 `telegram-bots.yml` 即可。拆分多文件时，每份 YAML 都声明相同 generation，更新时递增整个集合；临时文件使用不匹配后缀再 rename。日志默认目录按 `${application.name}` 展开，容器挂载必须覆盖展开后的路径，环境显式空值关闭文件输出。

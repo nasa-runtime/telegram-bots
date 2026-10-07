@@ -2,7 +2,7 @@
 
 ## 开发环境
 
-使用 Linux 或 macOS、Rust 1.94 或更新版本，保持 `Cargo.lock`。产品依赖来自 crates.io 的 `nasa 2.0.1` 及锁定依赖图，无需相邻项目或本地路径覆盖。
+使用 Linux 或 macOS、Rust 1.94 或更新版本，保持 `Cargo.lock`。产品依赖来自 crates.io 的 `nasa 2.0.2` 及锁定依赖图，无需相邻项目或本地路径覆盖。
 
 ```sh
 cargo fmt --all --check

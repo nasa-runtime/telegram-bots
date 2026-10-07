@@ -4,7 +4,7 @@
 
 A multi-bot Telegram text notification gateway for backend services. Callers select bot and destination aliases; the gateway owns Telegram tokens, chat identities and caller permissions. An external YAML catalog and credential files support adding and removing bots, rotating credentials and changing authorization without rebuilding the image or restarting the process.
 
-Built on crates.io `nasa 2.0.1`, the service uses `#[nasa::application("log", "web", "nacos-discovery")]` so napp owns startup, business initialization, readiness and shutdown. It provides bounded in-memory queues, one serial consumer per Telegram identity, a global outbound concurrency limit, atomic catalog publication and bounded draining. **HTTP 202 confirms in-memory acceptance only.** It does not confirm Telegram delivery or that a user has read a message.
+Built on crates.io `nasa 2.0.2`, the service uses `#[nasa::application("log", "web", "nacos-discovery")]` so napp owns startup, business initialization, readiness and shutdown. It provides bounded in-memory queues, one serial consumer per Telegram identity, a global outbound concurrency limit, atomic catalog publication and bounded draining. **JSON code=200 confirms in-memory acceptance only.** It does not confirm Telegram delivery or that a user has read a message.
 
 ## Capabilities and limits
 
@@ -26,8 +26,9 @@ The macro supplies `app` for business lifecycle registration:
 /// 业务作用：把通知目录生命周期交给 napp。
 /// 参数说明：`app` 是尚未开放业务入口的应用容器。
 /// 返回：登记成功后继续初始化，目录不可用时拒绝启动。
-#[nasa::application("log", "web", "nacos-discovery")]
+#[nasa::application("log", "web", "nacos-discovery", config = telegram_bots::catalog::source::bootstrap_loader)]
 async fn main(app: nasa::Application) -> anyhow::Result<()> {
+    rest::install(&app)?;
     telegram_bots::application::install(&app)?;
     Ok(())
 }
@@ -56,7 +57,7 @@ NASA's `nalog` component is enabled through the `log` feature and `"log"` in the
 
 The default is `info` level with console output plus `info.log` and a separate `error.log` under `/usr/local/logs/telegram-bots`. Set `TELEGRAM_LOG_LEVEL=warn` to change the level, or `TELEGRAM_LOG_PATH=/absolute/log/directory` to change the directory. An explicitly empty `TELEGRAM_LOG_PATH` selects console output only. The log directory must be writable. This service rotates files daily or at 100 MiB, retains archives for seven days and limits each of the `info` and `error` archive sets to 1 GiB. Active files are excluded from those caps; cleanup runs at startup and rotation.
 
-Logging belongs to the bootstrap `log` section and should be changed with an application restart. External bot catalogs cannot configure logging. The default path is fixed and does not follow changes to `application.name`; the current `naml 2.0.0` dependency cannot reliably resolve nested placeholder defaults. File output requires a dedicated writable mount for UID 10001 in containers. Explicitly disabling file output allows a read-only root without a log volume. See the [configuration reference](docs/configuration.md).
+Logging belongs to the bootstrap `log` section and should be changed with an application restart. External bot catalogs cannot configure logging. The expression `${TELEGRAM_LOG_PATH:/usr/local/logs/${application.name}}` follows the application name when the environment variable is absent. An explicitly empty value disables file logging. The container examples use UID 10001; file output requires a dedicated mount writable by that user. Explicitly disabling file output allows a read-only root without a log volume. See the [configuration reference](docs/configuration.md).
 
 ## Start locally
 
@@ -71,11 +72,11 @@ export TELEGRAM_LOG_PATH="$PWD/logs"
 ./target/release/telegram-bots
 ```
 
-The build produces only `telegram-bots`, which is also the only application executable installed in the Docker image. After preparing the configuration and environment variables above, use `cargo run --locked` for development. Configure the same absolute `TELEGRAM_YML` path and a writable `TELEGRAM_LOG_PATH` directory in your IDE, and use the project root as its working directory. Without `TELEGRAM_YML`, the service reads `/etc/conf/telegram-bots.yml`; a missing file prevents startup.
+The build produces the `telegram-bots` executable. After preparing the configuration and environment variables above, use `cargo run --locked` for development. Configure the same absolute `TELEGRAM_YML` path and a writable `TELEGRAM_LOG_PATH` directory in your IDE, and use the project root as its working directory. Without `TELEGRAM_YML`, the service matches `/etc/conf/telegram*.yml`; no matches prevent startup. An exact absolute file path is also accepted.
 
 The default listener is `0.0.0.0:2060`. Check `/readyz` and `/metrics` from an internal network. An empty catalog can start, but has no authenticated business callers.
 
-The image retains its immutable `/app/zcf/application.yml` bootstrap and reads `/etc/conf/telegram-bots.yml` by default. `TELEGRAM_YML` can select another absolute path at startup. Mount configuration and credentials as directories, not individual files. See [container deployment](docs/container-deployment.md) for Docker and Kubernetes, including non-root operation and read-only mounts.
+Container deployment requires an image built and supplied by the operator, with an immutable `/app/zcf/application.yml` bootstrap. The service matches `/etc/conf/telegram*.yml` by default. `TELEGRAM_YML` can select another absolute path at startup. Mount configuration and credentials as directories, not individual files. See [container deployment](docs/container-deployment.md) for image requirements and Docker and Kubernetes examples, including non-root operation and read-only mounts.
 
 ## Configure a bot
 
@@ -87,7 +88,7 @@ Set `generation` to an integer in `1..=9007199254740991`, greater than the appli
 
 The default poll interval is one second. Publication requires two consecutive matching complete reads. With normal scheduling and fast local file reads, a stable change usually takes about one to two seconds to apply, plus reading and validation time. Check the configuration status if a stable visible change remains unapplied after ten seconds; this is an operational threshold, not a guaranteed maximum delay. External catalog and credential reads execute in a separate helper process during both initialization and runtime. The default read budget is three seconds, followed by at most one second to terminate and reap the helper. Runtime timeouts retain the working catalog and subsequent polls retry; startup timeouts exit without opening the listener. Failure to reap the helper stops the service. Platform projection delays or mismatched credentials can extend the wait.
 
-Imports are explicit lists of absolute `file` paths with an explicit `optional` flag. Glob expressions such as `/etc/conf/*.yml`, recursive imports and inline secret material are unsupported. Unknown fields fail closed. See the [configuration reference](docs/configuration.md) for all fields, precedence and limits.
+Imports are explicit lists of absolute `file` paths or single-directory filename patterns, each with an explicit `optional` flag. Patterns such as `/etc/conf/telegram*.yml` load files in natural filename order; later files override earlier files. Recursive imports, directory wildcards and inline secret material are unsupported. Unknown fields fail closed. See the [configuration reference](docs/configuration.md) for all fields, precedence and limits.
 
 ## Calling from a business service
 
@@ -142,7 +143,7 @@ curl -i --connect-timeout 2 --max-time 10 \
 HTTP 200 response:
 
 ```json
-{"bots":[{"bot_id":"ops","description":"Operations notifications","destinations":["alerts"],"default_destination":"alerts","messages_path":"/api/bots/ops/messages"}]}
+{"code":200,"data":{"bots":[{"bot_id":"ops","description":"Operations notifications","destinations":["alerts"],"default_destination":"alerts","messages_path":"/api/bots/ops/messages"}]}}
 ```
 
 Use `bot_id` in the submission path and choose a `destination` alias. `messages_path` is relative to the base URL. A null `default_destination` means callers must select a destination. An empty `bots` list means authentication succeeded but no bot is available to this caller. Tokens, chat IDs and other callers' permissions are not exposed.
@@ -176,41 +177,45 @@ Example body using every optional field:
 {"text":"<b>Order alert</b>: processing delay exceeds the threshold","destination":"alerts","parse_mode":"HTML","disable_notification":false,"protect_content":true}
 ```
 
-Successful admission returns **HTTP 202 Accepted**:
+Successful admission returns **HTTP 200 OK**:
 
 ```json
-{"bot_id":"ops","destination":"alerts","accepted":true}
+{"code":200,"data":{"bot_id":"ops","destination":"alerts","accepted":true}}
 ```
 
 This names the selected bot and destination and confirms in-memory admission. There is no message ID, task ID or result lookup URL. Do not resend merely because a message has not yet appeared in Telegram: queued messages wait for earlier work, send intervals and platform cooldowns.
 
 ### Handle results and retries
 
+All business endpoints return **HTTP 200** with `nasa::base::BaseResponse`: `{"code":200,"data":...}`. The numeric JSON `code` carries the processing result: 200 means success; 400, 401, 403, 429, 503 and other documented codes mean rejection or failure. Successful responses omit `msg`. Unset `msg` and `data` fields are omitted; `code` is always present. Check JSON `code`; HTTP 200 or `curl --fail` alone cannot establish business success. `/healthz` and `/readyz` retain real probe statuses, and `/metrics` retains its monitoring format.
+
 Reuse an HTTP connection pool and configure connection/response deadlines. The two-second connect and ten-second total deadlines above are client examples; adjust them to the deployment network. The request waits for admission only. Disable unconditional automatic retries of POST network failures.
 
-| HTTP result | Meaning | Caller action |
+| JSON code | Meaning | Caller action |
 | --- | --- | --- |
-| 202 | Accepted into the bounded memory queue | Record gateway acceptance, not Telegram delivery |
+| 200 | Accepted into the bounded memory queue | Record gateway acceptance, not Telegram delivery |
 | 400 | Invalid text or destination | Correct the message |
 | 401 | Incorrect/rotated credential, unknown ID or duplicate identity header | Check current identity settings |
 | 403 | Bot is not authorized | Refresh the catalog or request access |
 | 404 | Route/catalog entry was not found | Check base URL, path and alias |
+| 405 | Method not supported | Use GET or POST as documented |
+| 500 | Request processing failed; outcome may be unknown | Do not retry automatically; inspect service and business state |
 | 408 | Upload timed out before admission | Resolve the slow upload before resubmitting |
 | 413 | Body too large | Reduce the request; do not encode attachments in text |
 | 415 / 422 | Unsupported media type or invalid JSON fields/types | Follow the parameter table |
 | 429 | Bot or process capacity exhausted | Confirm non-admission, then use bounded backoff |
-| 503 | Not ready, stopping or catalog changed during upload | Confirm non-admission, refresh catalog/credentials and use bounded backoff |
+| 503 | Ingress overload, not ready, stopping or catalog changed during upload | Confirm non-admission, refresh catalog/credentials and use bounded backoff |
 | Disconnect, client timeout or proxy 502/504 | Admission cannot be determined | Do not retry blindly; apply the business policy for possible duplicates |
 
 A business rejection can use this envelope:
 
 ```json
-{"error":{"code":"queue_full","message":"通知队列或进程预算已满","delivery":"not_sent","retry_safe":true}}
+{"code":429,"msg":"通知队列或进程预算已满","data":{"reason":"queue_full","delivery":"not_sent","retry_safe":true}}
 ```
 
-`delivery=not_sent` means this request was not queued. `retry_safe=true` allows a later attempt for this rejection; it does not provide idempotency. Routing, media, proxy and framework failures can have different response shapes. Check HTTP status and parse only recognized envelopes; do not treat every non-2xx response as safe to repeat.
+Rejections also return HTTP 200. `data.reason` identifies the stable cause; `data.delivery=not_sent` means this request was not queued. `data.retry_safe=true` allows a later attempt but does not provide idempotency. Validate the envelope and check numeric `code`. Proxy failures, disconnects and malformed HTTP protocol requests may not contain this service's JSON and do not prove non-admission.
 
-Each accepted message gets at most one Telegram request attempt, with no automatic resend. Failures, uncertain outcomes and shutdown drops after 202 appear only in logs and aggregate metrics. There is no callback or per-message result API. Businesses requiring durable notifications should retain persistent tasks upstream and define duplicate/unknown-result handling; this gateway is not a durable message system.
+Each accepted message gets at most one Telegram request attempt, with no automatic resend. Failures, uncertain outcomes and shutdown drops after code=200 appear only in logs and aggregate metrics. There is no callback or per-message result API. Businesses requiring durable notifications should retain persistent tasks upstream and define duplicate/unknown-result handling; this gateway is not a durable message system.
 
 ### Configuration status and probes
 
@@ -247,3 +252,11 @@ The listener is plain HTTP. Use a trusted TLS proxy and restrict business access
 ## Contributing and licensing
 
 See [contribution guidance](CONTRIBUTING.md). Licensed under either [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option. The detailed reference documents currently use Chinese; configuration keys and public APIs are identical in both README versions.
+
+## Ordered files and nested defaults
+
+`yml.imports` accepts filename `*` and `?` within one fixed directory. Each declaration is expanded separately in natural filename order: `telegram-1.yml`, `telegram-2.yml`, `telegram-02.yml`, `telegram-10.yml`. Later files override earlier files, and environment overrides apply last. Quote patterns in shell assignments, for example `TELEGRAM_YML='/etc/conf/telegram*.yml'`. Recursive patterns, directory wildcards and nested imports are rejected.
+
+Every matched source must be a regular YAML file and declare the same generation. Changes to the resolved configuration require a higher generation across the complete set. Renaming a source without changing the resolved values is still revalidated on every polling cycle and does not create new consumers. Directory enumeration, reads and source revalidation share the existing terminable reader process and deadline. Invalid content, mixed generations, duplicate file identities or credential digest mismatches keep the previous catalog active. Bootstrap source declarations and profile changes require a restart.
+
+The application's `config = telegram_bots::catalog::source::bootstrap_loader` factory fixes configuration rules before napp preflight; the business lifecycle continues to own isolated catalog loading. `naml` resolves nested expressions and `nalog` consumes the final log path. See the [configuration contract](docs/configuration.md) for limits and failure behavior.

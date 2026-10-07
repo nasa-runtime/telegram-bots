@@ -1501,17 +1501,22 @@ checksum = "83190cbc7ad9c210e178cd96ddcb67177e57c391068115fbe639669e7086297e"
 
 [[package]]
 name = "naml"
-version = "2.0.0"
+version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "83b7e49e606b4867da47efc1928e8d0592675f470f4770ee025697faac8917f5"
+checksum = "85ccc82026da94e53f7e830cd7f0ab7a9fee0e3c5339ab6375597cac4554d6a0"
 dependencies = [
  "anyhow",
  "config",
+ "libc",
  "nabase",
  "notify",
  "serde",
  "serde_json",
+ "serde_path_to_error",
+ "sha2",
+ "toml",
  "tracing",
+ "yaml-rust2",
 ]
 
 [[package]]
@@ -1539,9 +1544,9 @@ dependencies = [
 
 [[package]]
 name = "napp"
-version = "2.0.1"
+version = "2.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dfba1d9a4554d517fd73cc07f956b4ed2e8ee2be7c2db8232fcd4b9254468a5a"
+checksum = "94e0863d19fdb8244b4f8ae5857727dcad1c1535c25d58ab43b2be33d400d030"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1587,9 +1592,9 @@ dependencies = [
 
 [[package]]
 name = "napp-macro"
-version = "2.0.0"
+version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "90ed1005f0c826fad6e7fb9c8e50976731691c5e894f846e4378ec38f1e2713d"
+checksum = "f8b3c6e58e89413fd29c305d381273ecaf11c249dbaa5b042d3fbace546c47b2"
 dependencies = [
  "macro-support",
  "proc-macro2",
@@ -1599,10 +1604,11 @@ dependencies = [
 
 [[package]]
 name = "nasa"
-version = "2.0.1"
+version = "2.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "25a10ebd2922f174caef5c30b44d1b31252ba630c1d2e5faff992b3154d0d095"
+checksum = "cc7cfa8a7bb6849ed16a996cde8f140fd346caa215e09412a07cb8bea6a0a544"
 dependencies = [
+ "nabase",
  "nadisc",
  "nalog",
  "naml",
@@ -2426,19 +2432,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "serde_yaml"
-version = "0.9.34+deprecated"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a8b1a1a2ebf674015cc02edccce75287f1a0130d394307b36743c2f5d504b47"
-dependencies = [
- "indexmap",
- "itoa",
- "ryu",
- "serde",
- "unsafe-libyaml",
-]
-
-[[package]]
 name = "sha1"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2613,10 +2606,10 @@ dependencies = [
 
 [[package]]
 name = "telegram-bots"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
- "config",
+ "futures-util",
  "http",
  "http-body-util",
  "libc",
@@ -2624,7 +2617,6 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "serde_yaml",
  "sha2",
  "subtle",
  "tokio",
@@ -2797,10 +2789,12 @@ version = "1.1.4+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3aace63f4bbcdfc2c965b059de67119c89c4017a70d633be6c104910f67056f5"
 dependencies = [
+ "indexmap",
  "serde_core",
  "serde_spanned",
  "toml_datetime",
  "toml_parser",
+ "toml_writer",
  "winnow",
 ]
 
@@ -2833,6 +2827,12 @@ checksum = "1d38ac1cf9b95face32296c0a3ede1fdc270627c9d9c02a7274dd6d960dc4d56"
 dependencies = [
  "winnow",
 ]
+
+[[package]]
+name = "toml_writer"
+version = "1.1.2+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d56353a2a665ad0f41a421187180aab746c8c325620617ad883a99a1cbe66d2"
 
 [[package]]
 name = "tonic"
@@ -3045,12 +3045,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "unsafe-libyaml"
-version = "0.2.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
-
-[[package]]
 name = "untrusted"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3212,7 +3206,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

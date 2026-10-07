@@ -167,7 +167,7 @@ impl Drop for DeliveryGuard {
 
 /// 业务作用：在有界队列预算耗尽时拒绝新通知。
 /// 参数说明：无。
-/// 返回：HTTP 429 且尚未发送。
+/// 返回：处理码为 429 且尚未发送，业务 HTTP 响应仍为 200。
 fn full() -> ApiError {
     ApiError::not_sent(
         StatusCode::TOO_MANY_REQUESTS,
@@ -178,7 +178,7 @@ fn full() -> ApiError {
 
 /// 业务作用：在目录或队列已失去服务权时拒绝新通知。
 /// 参数说明：无。
-/// 返回：HTTP 503 且尚未发送。
+/// 返回：处理码为 503 且尚未发送，业务 HTTP 响应仍为 200。
 pub(crate) fn unavailable() -> ApiError {
     ApiError::not_sent(
         StatusCode::SERVICE_UNAVAILABLE,

@@ -1,10 +1,12 @@
 use std::sync::Arc;
 
 use http_body_util::{BodyExt, LengthLimitError, Limited};
+use nasa::base::BaseResponse;
 use nasa::web::{get_mapping, post_mapping, Extension, Json, Path, Request, State, StatusCode};
 use telegram_bots::service::{AcceptedReceipt, ApiError, Caller, Catalog, SendMessage};
 
 use super::auth::authenticate;
+use super::response::success;
 
 /// 业务作用：帮助业务方选择其权限范围内的机器人和目的地。
 /// 参数说明：`service` 是认证阶段固定的发送目录；`caller` 是认证身份。
@@ -13,19 +15,18 @@ use super::auth::authenticate;
 async fn list_bots(
     Extension(service): Extension<Arc<Catalog>>,
     Extension(caller): Extension<Arc<Caller>>,
-) -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "bots": service.list_bots(&caller) }))
+) -> Json<BaseResponse<serde_json::Value>> {
+    success(serde_json::json!({ "bots": service.list_bots(&caller) }))
 }
 
 /// 业务作用：接收有界消息并立即移交 bot 的保序内存队列，释放 HTTP 请求资源。
 /// 参数说明：`app` 提供应用状态；`service` 为发送资源；`caller` 为认证身份；`bot_id` 为机器人别名；`request` 提供 JSON 正文。
-/// 返回：内存受理返回 202；校验、读取超时或容量拒绝返回错误，不等待后台发送。
+/// 返回：所有处理结果均为 HTTP 200；code=200 表示内存受理，其它 code 表示拒绝，不等待后台发送。
 #[post_mapping(
     path = "/api/bots/{bot_id}/messages",
     consumes = "application/json",
     auth = "required",
-    interceptors(authenticate),
-    success_status = 202
+    interceptors(authenticate)
 )]
 async fn send_message(
     State(app): State<nasa::Application>,
@@ -33,7 +34,7 @@ async fn send_message(
     Extension(caller): Extension<Arc<Caller>>,
     Path(bot_id): Path<String>,
     request: Request,
-) -> Result<(StatusCode, Json<AcceptedReceipt>), ApiError> {
+) -> Result<Json<BaseResponse<AcceptedReceipt>>, ApiError> {
     // 身份门禁已通过，再限制缓冲和读取总期限，避免大消息或慢上传长期占用请求资源。
     let bytes = tokio::time::timeout(
         service.body_read_timeout(),
@@ -66,5 +67,5 @@ async fn send_message(
     })?;
     service
         .enqueue(&app, &caller, &bot_id, message)
-        .map(|receipt| (StatusCode::ACCEPTED, Json(receipt)))
+        .map(success)
 }

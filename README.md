@@ -4,7 +4,7 @@
 
 面向业务服务的多机器人 Telegram 文本通知网关。调用方只提交机器人别名、目的地别名和正文；token、聊天身份与调用权限由服务集中管理。修改外部 YAML 和凭据文件即可增删机器人、轮换凭据及调整授权，无需重建镜像或重启进程。
 
-服务使用 crates.io 的 `nasa 2.0.1`，通过 `#[nasa::application("log", "web", "nacos-discovery")]` 由 napp 管理启动、业务初始化、就绪与停机，提供有界内存队列、每个 Telegram 身份的串行发送、独立排队容量、全局出站限额，以及可观测的配置拒绝和限时排空。`202 Accepted` 只确认内存受理，不表示 Telegram 已发送或用户已收到。
+服务使用 crates.io 的 `nasa 2.0.2`，通过 `#[nasa::application("log", "web", "nacos-discovery")]` 由 napp 管理启动、业务初始化、就绪与停机，提供有界内存队列、每个 Telegram 身份的串行发送、独立排队容量、全局出站限额，以及可观测的配置拒绝和限时排空。`code=200` 只确认内存受理，不表示 Telegram 已发送或用户已收到。
 
 ## 核心能力与边界
 
@@ -26,8 +26,9 @@
 /// 业务作用：把通知目录生命周期交给 napp。
 /// 参数说明：`app` 是尚未开放业务入口的应用容器。
 /// 返回：登记成功后继续初始化，目录不可用时拒绝启动。
-#[nasa::application("log", "web", "nacos-discovery")]
+#[nasa::application("log", "web", "nacos-discovery", config = telegram_bots::catalog::source::bootstrap_loader)]
 async fn main(app: nasa::Application) -> anyhow::Result<()> {
+    rest::install(&app)?;
     telegram_bots::application::install(&app)?;
     Ok(())
 }
@@ -56,7 +57,7 @@ async fn main(app: nasa::Application) -> anyhow::Result<()> {
 
 默认级别为 `info`，同时写控制台及 `/usr/local/logs/telegram-bots` 下的 `info.log` 和独立的 `error.log`。设置 `TELEGRAM_LOG_LEVEL=warn` 可调整级别；`TELEGRAM_LOG_PATH=/绝对路径/日志目录` 可覆盖目录，显式设置为空则只写控制台。日志目录必须可写。本项目文件策略为按天或单文件达到 100 MiB 滚动、保留 7 天；`info` 与 `error` 各自的归档容量上限为 1 GiB，不包含当前活动文件。清理随启动和滚动执行。
 
-日志配置位于引导文件的 `log` 段，调整后重启应用；外部机器人 YAML 不接受日志设置。默认路径是固定值，不随 `application.name` 改变；当前 `naml 2.0.0` 不支持可靠的嵌套占位符默认值。容器启用文件输出时需挂载 UID 10001 可写的专用目录；显式关闭文件输出后可仅使用只读根文件系统。详细配置与边界见[配置合同](docs/configuration.md)。
+日志配置位于引导文件的 `log` 段，调整后重启应用；外部机器人 YAML 不接受日志设置。默认表达式为 `${TELEGRAM_LOG_PATH:/usr/local/logs/${application.name}}`，未设置环境变量时目录跟随应用名称；环境显式空值关闭文件日志。本文容器示例使用 UID 10001，启用文件输出时需挂载该用户可写的专用目录；显式关闭文件输出后可仅使用只读根文件系统。详细配置与边界见[配置合同](docs/configuration.md)。
 
 ## 快速开始
 
@@ -71,7 +72,7 @@ export TELEGRAM_LOG_PATH="$PWD/logs"
 ./target/release/telegram-bots
 ```
 
-构建只生成 `telegram-bots`，Docker 镜像也只安装这个程序。准备好上述配置与环境变量后，开发环境可直接执行 `cargo run --locked`；IDE 设置同一 `TELEGRAM_YML` 绝对路径及 `TELEGRAM_LOG_PATH` 可写目录，并将工作目录设为项目根目录即可。未设置 `TELEGRAM_YML` 时读取 `/etc/conf/telegram-bots.yml`；文件不存在会拒绝启动。
+构建只生成 `telegram-bots` 程序。准备好上述配置与环境变量后，开发环境可直接执行 `cargo run --locked`；IDE 设置同一 `TELEGRAM_YML` 绝对路径及 `TELEGRAM_LOG_PATH` 可写目录，并将工作目录设为项目根目录即可。未设置 `TELEGRAM_YML` 时按 `/etc/conf/telegram*.yml` 匹配；零匹配会拒绝启动。也可设置为单个绝对文件路径。
 
 监听地址默认为 `0.0.0.0:2060`。另一个终端访问：
 
@@ -80,7 +81,7 @@ curl --fail http://127.0.0.1:2060/readyz
 curl --fail http://127.0.0.1:2060/metrics
 ```
 
-空目录允许服务启动，但不提供业务调用凭据。`zcf/application.yml` 是引导文件，外部目录路径通过 `TELEGRAM_YML` 在启动时选择。镜像使用不可变的引导文件，外部目录默认 `/etc/conf/telegram-bots.yml`，具体操作见[容器部署](docs/container-deployment.md)。
+空目录允许服务启动，但不提供业务调用凭据。`zcf/application.yml` 是引导文件，外部目录路径通过 `TELEGRAM_YML` 在启动时选择。容器部署需自行提供镜像并保留不可变的引导文件，外部模式默认 `/etc/conf/telegram*.yml`，镜像要求与运行示例见[容器部署](docs/container-deployment.md)。
 
 ## 配置一个机器人
 
@@ -99,6 +100,8 @@ curl --fail http://127.0.0.1:2060/metrics
 ## 业务微服务接入
 
 业务方通过普通 HTTP JSON 调用，不需要使用 NASA 或 Rust，也不需要持有 Telegram bot token。接入前由部署者提供四项信息：**网关基础地址、调用方 ID、该调用方的认证凭据、可用的机器人与目的地别名**。空目录启动示例没有业务身份，必须先完成授权配置才能调用 `/api/`。
+
+业务接口统一使用 `nasa::base::BaseResponse`：HTTP Status 为 **200**，JSON 为 `{"code":200,"data":...}`。`code` 才是处理结果：200 成功，400、401、403、429、503 等表示对应拒绝；成功响应省略 `msg`；未设置的 `msg`、`data` 不序列化，`code` 始终保留。调用方必须检查 JSON `code`，`curl --fail` 或 HTTP 200 本身不能判断业务成功。`/healthz`、`/readyz` 保留真实探针状态，`/metrics` 保留监控格式。
 
 ### 地址如何填写
 
@@ -149,7 +152,7 @@ curl -i --connect-timeout 2 --max-time 10 \
 成功返回 HTTP 200：
 
 ```json
-{"bots":[{"bot_id":"ops","description":"运维通知","destinations":["alerts"],"default_destination":"alerts","messages_path":"/api/bots/ops/messages"}]}
+{"code":200,"data":{"bots":[{"bot_id":"ops","description":"运维通知","destinations":["alerts"],"default_destination":"alerts","messages_path":"/api/bots/ops/messages"}]}}
 ```
 
 `bot_id` 用于发送路径，`destinations` 提供可选目的地别名，`messages_path` 是相对基础地址的发送路径。`default_destination=null` 表示调用时必须选择目的地。返回 `bots: []` 表示身份有效但没有可用机器人。目录不暴露 bot token、真实 chat_id 或其它调用方权限。
@@ -185,41 +188,43 @@ curl -i --connect-timeout 2 --max-time 10 \
 {"text":"<b>订单告警</b>：任务处理延迟超过阈值","destination":"alerts","parse_mode":"HTML","disable_notification":false,"protect_content":true}
 ```
 
-成功返回 **HTTP 202 Accepted**：
+成功返回 **HTTP 200 OK**：
 
 ```json
-{"bot_id":"ops","destination":"alerts","accepted":true}
+{"code":200,"data":{"bot_id":"ops","destination":"alerts","accepted":true}}
 ```
 
-三个字段分别是实际选择的机器人、目的地和内存受理标识。响应不提供 `message_id`、任务 ID 或结果查询地址。收到 202 后不要因尚未看到 Telegram 消息而立即重发；队列会按同机器人受理顺序尝试发送，发送间隔、平台冷却和队列积压都会影响实际到达时间。
+`data` 中三个字段分别是实际选择的机器人、目的地和内存受理标识。响应不提供 `message_id`、任务 ID 或结果查询地址。收到 code=200 后不要因尚未看到 Telegram 消息而立即重发；队列会按同机器人受理顺序尝试发送，发送间隔、平台冷却和队列积压都会影响实际到达时间。
 
 ### 业务代码如何处理结果
 
 HTTP 客户端应复用连接池并设置连接、响应期限。上面的 2 秒连接与 10 秒总期限是客户端示例值，应按部署网络调整；请求仅等待入队，不等待 Telegram 发送完成。关闭对 POST 网络错误的无条件自动重试。
 
-| HTTP 结果 | 含义 | 业务侧处理 |
+| JSON code | 含义 | 业务侧处理 |
 | --- | --- | --- |
-| 202 | 已进入有界内存队列 | 记录为网关已受理，不标记为 Telegram 已送达 |
+| 200 | 已进入有界内存队列 | 记录为网关已受理，不标记为 Telegram 已送达 |
 | 400 | 空白或超长文本、目的地无效等 | 调整内容或目的地后提交 |
 | 401 | ID/凭据错误、身份头重复或凭据已轮换 | 核对当前调用方 ID 和凭据 |
 | 403 | 没有目标 bot 的权限 | 联系部署者调整授权或重新查询目录 |
 | 404 | 路由或目录未命中 | 核对基础地址、API 路径和 bot 别名 |
+| 405 | 请求方法不支持 | 按接口表使用 GET 或 POST |
+| 500 | 请求处理异常，结果可能未知 | 不自动重发，检查服务日志与业务状态 |
 | 408 | 上传超时，未入队 | 排除慢上传后重新提交 |
 | 413 | JSON 请求过大 | 缩小请求；不要把附件编码进 text |
 | 415 / 422 | 媒体类型、JSON 字段或类型不符 | 使用 JSON 并按参数表调整 |
 | 429 | 机器人队列或进程容量已满 | 确认未受理后，采用有次数和总期限上限的退避重试 |
-| 503 | 未 Ready、停机或上传期间目录已切换 | 确认未受理后，刷新目录/凭据并有限退避 |
+| 503 | 入口过载、未 Ready、停机或上传期间目录已切换 | 确认未受理后，刷新目录/凭据并有限退避 |
 | 连接中断、客户端超时、代理 502/504 | 无法确定网关是否已经受理 | 不盲目补发，由业务决定重复通知风险与后续处置 |
 
 业务端点的拒绝正文示例：
 
 ```json
-{"error":{"code":"queue_full","message":"通知队列或进程预算已满","delivery":"not_sent","retry_safe":true}}
+{"code":429,"msg":"通知队列或进程预算已满","data":{"reason":"queue_full","delivery":"not_sent","retry_safe":true}}
 ```
 
-`delivery=not_sent` 表示本次请求未入队；`retry_safe=true` 表示该拒绝允许稍后重试，不表示请求具有幂等性。路由、媒体类型、代理或框架层错误可能采用不同 JSON 结构；先检查 HTTP 状态，再解析已识别的信封，不能把所有非 2xx 都认作可安全重发。
+拒绝同样返回 HTTP 200。`data.reason` 是稳定原因，`data.delivery=not_sent` 表示本次请求未入队；`data.retry_safe=true` 允许稍后重试，不表示请求具有幂等性。先确认收到合法外壳，再检查数字 `code`。代理、连接中断或无法解析的 HTTP 请求属于传输边界，可能没有本服务的 JSON，不能据此推断未受理。
 
-服务每条受理消息最多进行一次 Telegram 请求，不自动补发。202 之后的明确失败、结果未知或停机丢弃只体现在日志和指标中，没有异步回调或逐条结果查询接口。若通知不能丢失，业务方应保留持久任务，并设计重复通知与结果未知的处理策略；本服务不替代持久消息系统。
+服务每条受理消息最多进行一次 Telegram 请求，不自动补发。code=200 之后的明确失败、结果未知或停机丢弃只体现在日志和指标中，没有异步回调或逐条结果查询接口。若通知不能丢失，业务方应保留持久任务，并设计重复通知与结果未知的处理策略；本服务不替代持久消息系统。
 
 ### 配置状态和连通性
 
@@ -239,7 +244,7 @@ curl -i --connect-timeout 2 --max-time 10 \
   -H "Authorization: Bearer $TELEGRAM_CLIENT_KEY"
 ```
 
-业务接入顺序为：确认内网地址可达 → 使用凭据查询 `/api/bots` → 选定 bot/目的地发送 → 按 202 与拒绝结果分类处理。完整控制面响应和接口细节见 [HTTP API](docs/http-api.md)。探针和监控端点应限制到内部网络；配置错误保留旧目录时 `/readyz` 仍可能正常。
+业务接入顺序为：确认内网地址可达 → 使用凭据查询 `/api/bots` → 选定 bot/目的地发送 → 按 code=200 与拒绝结果分类处理。完整控制面响应和接口细节见 [HTTP API](docs/http-api.md)。探针和监控端点应限制到内部网络；配置错误保留旧目录时 `/readyz` 仍可能正常。
 
 ## 架构与运维
 
@@ -254,3 +259,11 @@ HTTP 连接与缓冲预算、应用身份、listener、配置来源、观察开�
 ## 参与与许可
 
 开发入口见[贡献说明](CONTRIBUTING.md)。项目按 [MIT](LICENSE-MIT) 或 [Apache-2.0](LICENSE-APACHE) 双许可证提供，可任选其一。
+
+## 有序配置文件与嵌套默认值
+
+`yml.imports` 支持单目录文件名 `*`、`?`，不支持递归、目录段通配或嵌套 import。各声明独立按自然文件名排序后合并：`telegram-1.yml`、`telegram-2.yml`、`telegram-02.yml`、`telegram-10.yml`，后者覆盖前者；环境最后覆盖。模式需在环境变量中作为原文传入，例如 `TELEGRAM_YML='/etc/conf/telegram*.yml'`。
+
+所有已匹配文件必须是普通 YAML 文件，且每份都声明相同 generation；最终配置值改变时需让整批文件使用更大的 generation。仅改名且最终配置值不变时，每轮仍复验新来源，但不会创建新消费者。目录枚举、文件读取和来源复验共用可终止读取进程及原有期限；坏文件、来源增删期间的不一致、重复真实身份和摘要不匹配均保留旧目录。来源声明、profile 与引导设置改变需要重启。
+
+主程序通过 `config = telegram_bots::catalog::source::bootstrap_loader` 在 napp preflight 前固定配置规则；机器人目录仍由业务生命周期隔离读取。`naml` 负责嵌套解析，`nalog` 接收最终日志目录。完整限制见[配置合同](docs/configuration.md)。
