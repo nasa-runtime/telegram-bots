@@ -72,7 +72,7 @@ export TELEGRAM_LOG_PATH="$PWD/logs"
 ./target/release/telegram-bots
 ```
 
-构建只生成 `telegram-bots` 程序。准备好上述配置与环境变量后，开发环境可直接执行 `cargo run --locked`；IDE 设置同一 `TELEGRAM_YML` 绝对路径及 `TELEGRAM_LOG_PATH` 可写目录，并将工作目录设为项目根目录即可。未设置 `TELEGRAM_YML` 时按 `/etc/conf/telegram*.yml` 匹配；零匹配会拒绝启动。也可设置为单个绝对文件路径。
+构建只生成 `telegram-bots` 程序。准备好上述配置与环境变量后，开发环境可直接执行 `cargo run --locked`；IDE 设置同一 `TELEGRAM_YML` 绝对路径及 `TELEGRAM_LOG_PATH` 可写目录，并将工作目录设为项目根目录即可。未设置 `TELEGRAM_YML` 时按 `/etc/telegram-bots/*.yml` 匹配；零匹配会拒绝启动。也可设置为单个绝对文件路径。
 
 监听地址默认为 `0.0.0.0:2060`。另一个终端访问：
 
@@ -81,7 +81,48 @@ curl --fail http://127.0.0.1:2060/readyz
 curl --fail http://127.0.0.1:2060/metrics
 ```
 
-空目录允许服务启动，但不提供业务调用凭据。`zcf/application.yml` 是引导文件，外部目录路径通过 `TELEGRAM_YML` 在启动时选择。容器部署需自行提供镜像并保留不可变的引导文件，外部模式默认 `/etc/conf/telegram*.yml`，镜像要求与运行示例见[容器部署](docs/container-deployment.md)。
+空目录允许服务启动，但不提供业务调用凭据。`zcf/application.yml` 是引导文件，外部目录路径通过 `TELEGRAM_YML` 在启动时选择。Docker Hub 镜像为 `nasaruntime/telegram-bots`，挂载 `/etc/telegram-bots` 目录即可加载外部 YAML，完整运行说明见[容器部署](docs/container-deployment.md)。
+
+## Docker 启动
+
+镜像：[`nasaruntime/telegram-bots:1.0.0`](https://hub.docker.com/r/nasaruntime/telegram-bots)。基于 Alpine，支持 `linux/amd64`、`linux/arm64`，默认以 UID/GID `10001:10001` 运行。配置来源为 `${TELEGRAM_YML:/etc/telegram-bots/*.yml}`，挂载整个 `/etc/telegram-bots` 目录即可。
+
+以下最小配置可启动服务并检查就绪；真正发送消息还需配置机器人、目的地、调用方和凭据：
+
+```sh
+mkdir -p deploy-local/config deploy-local/secrets
+cat > deploy-local/config/telegram-bots.yml <<'YAML'
+generation: 1
+telegram:
+  bots: {}
+  clients: {}
+secrets: {}
+YAML
+
+docker run --detach --name telegram-bots \
+  --read-only --cap-drop ALL --security-opt no-new-privileges \
+  --env TELEGRAM_LOG_PATH= \
+  --publish 127.0.0.1:2060:2060 \
+  --mount "type=bind,src=$PWD/deploy-local/config,dst=/etc/telegram-bots,readonly" \
+  --mount "type=bind,src=$PWD/deploy-local/secrets,dst=/run/secrets,readonly" \
+  nasaruntime/telegram-bots:1.0.0
+
+curl --fail http://127.0.0.1:2060/readyz
+docker logs --tail 100 telegram-bots
+```
+| 挂载或设置 | 用途 |
+| --- | --- |
+| `/etc/telegram-bots`，只读目录 | 加载所有 `.yml`，按文件名自然顺序合并，后者覆盖前者；至少需要一个文件 |
+| `/run/secrets`，只读目录 | 保存 token 和调用方凭据，YAML 通过 `secrets.*.file` 与 SHA-256 引用 |
+| `TELEGRAM_LOG_PATH=` | 仅输出控制台，适用于只读根文件系统 |
+| `/usr/local/logs/telegram-bots`，可写目录 | 保留默认文件日志时挂载，并移除空的 `TELEGRAM_LOG_PATH` 设置 |
+| `127.0.0.1:2060:2060` | 仅允许宿主机本地访问；业务容器同网络调用可用 `http://telegram-bots:2060` |
+
+参照 [catalog.yml](examples/catalog.yml) 填写真实业务配置，凭据文件应允许 UID 10001 或其受控组读取。启动后每次配置变更递增 `generation`；多文件的 `generation` 必须一致。原子替换配置文件时临时文件使用不匹配 `.yml` 的后缀。不要挂载单个配置文件，也不要覆盖镜像内 `/app/zcf/application.yml`。`TELEGRAM_YML` 可改为其它绝对路径或单目录模式。
+
+`/healthz`、`/readyz` 使用真实 HTTP 状态；业务 `/api/` 统一 HTTP 200，必须检查 JSON `code`。消息受理成功仅表示进入内存队列。停止时执行 `docker stop --time 70 telegram-bots`，为队列排空预留时间。
+
+构建文件为 [docker/Dockerfile](docker/Dockerfile)，可执行 `docker build -f docker/Dockerfile -t telegram-bots:local .`。完整日志挂载、Kubernetes、Nacos 和发布设置见[容器部署](docs/container-deployment.md)。
 
 ## 配置一个机器人
 
@@ -262,7 +303,7 @@ HTTP 连接与缓冲预算、应用身份、listener、配置来源、观察开�
 
 ## 有序配置文件与嵌套默认值
 
-`yml.imports` 支持单目录文件名 `*`、`?`，不支持递归、目录段通配或嵌套 import。各声明独立按自然文件名排序后合并：`telegram-1.yml`、`telegram-2.yml`、`telegram-02.yml`、`telegram-10.yml`，后者覆盖前者；环境最后覆盖。模式需在环境变量中作为原文传入，例如 `TELEGRAM_YML='/etc/conf/telegram*.yml'`。
+`yml.imports` 支持单目录文件名 `*`、`?`，不支持递归、目录段通配或嵌套 import。各声明独立按自然文件名排序后合并：`telegram-1.yml`、`telegram-2.yml`、`telegram-02.yml`、`telegram-10.yml`，后者覆盖前者；环境最后覆盖。模式需在环境变量中作为原文传入，例如 `TELEGRAM_YML='/etc/telegram-bots/*.yml'`。
 
 所有已匹配文件必须是普通 YAML 文件，且每份都声明相同 generation；最终配置值改变时需让整批文件使用更大的 generation。仅改名且最终配置值不变时，每轮仍复验新来源，但不会创建新消费者。目录枚举、文件读取和来源复验共用可终止读取进程及原有期限；坏文件、来源增删期间的不一致、重复真实身份和摘要不匹配均保留旧目录。来源声明、profile 与引导设置改变需要重启。
 

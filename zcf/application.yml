@@ -30,7 +30,7 @@ rest_discovery:
 
 yml:
   imports:
-    - file: ${TELEGRAM_YML:/etc/conf/telegram*.yml}
+    - file: ${TELEGRAM_YML:/etc/telegram-bots/*.yml}
       optional: false
 
 config_watch:

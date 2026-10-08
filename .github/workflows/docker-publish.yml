@@ -1,0 +1,184 @@
+name: Publish Docker image
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_run_id:
+        description: Successful release Rust workflow run containing the image archives
+        required: true
+        type: string
+      amd64_image_id:
+        description: Validated amd64 image ID including sha256 prefix
+        required: true
+        type: string
+      arm64_image_id:
+        description: Validated arm64 image ID including sha256 prefix
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: dockerhub-telegram-bots
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.ref == 'refs/heads/release'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+      BUILD_RUN_ID: ${{ inputs.build_run_id }}
+      AMD64_IMAGE_ID: ${{ inputs.amd64_image_id }}
+      ARM64_IMAGE_ID: ${{ inputs.arm64_image_id }}
+      HUB_NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE || vars.DOCKERHUB_USERNAME }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Verify source and completed build
+        run: |
+          python3 - <<'PY'
+          import json, os, re, subprocess, tomllib
+          from pathlib import Path
+          run_id = os.environ['BUILD_RUN_ID']
+          assert re.fullmatch(r'[0-9]+', run_id), 'Invalid build run ID'
+          for name in ['AMD64_IMAGE_ID', 'ARM64_IMAGE_ID']:
+              assert re.fullmatch(r'sha256:[a-f0-9]{64}', os.environ[name]), 'Invalid image ID'
+          repo, sha = os.environ['GITHUB_REPOSITORY'], os.environ['GITHUB_SHA']
+          run = json.loads(subprocess.check_output(['gh', 'api', f'repos/{repo}/actions/runs/{run_id}']))
+          assert run['head_sha'] == sha and run['head_branch'] == 'release', 'Source revision differs'
+          assert run['event'] in ['push', 'workflow_dispatch'], 'Untrusted build event'
+          assert run['path'] == '.github/workflows/ci.yml', 'Unexpected build workflow'
+          assert run['status'] == 'completed' and run['conclusion'] == 'success', 'Build is not successful'
+          for branch in ['master', 'release']:
+              ref = json.loads(subprocess.check_output(['gh', 'api', f'repos/{repo}/git/ref/heads/{branch}']))
+              assert ref['object']['sha'] == sha, f'{branch} has a different revision'
+          with open('Cargo.toml', 'rb') as manifest:
+              version = tomllib.load(manifest)['package']['version']
+          assert re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', version), 'Stable version required'
+          namespace = os.environ['HUB_NAMESPACE']
+          assert re.fullmatch(r'[a-z0-9][a-z0-9_-]*', namespace), 'Invalid Docker Hub namespace'
+          assert namespace == 'nasaruntime', 'Docker Hub documentation and namespace must agree'
+          assert Path('docker/README.md').is_file(), 'Docker Hub overview is required'
+          with open(os.environ['GITHUB_ENV'], 'a') as output:
+              output.write(f'IMAGE={namespace}/telegram-bots\nVERSION={version}\n')
+          PY
+      - name: Download image archives
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.build_run_id }}
+          pattern: image-*
+          merge-multiple: true
+          path: image-archives
+      - name: Verify exact image identities
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess
+          for arch in ['amd64', 'arm64']:
+              subprocess.run(['docker', 'load', '--input', f'image-archives/telegram-bots-{arch}.tar'], check=True)
+              tag = f'telegram-bots:build-{os.environ["GITHUB_SHA"]}-{arch}'
+              image = json.loads(subprocess.check_output(['docker', 'image', 'inspect', tag]))[0]
+              assert image['Id'] == os.environ[f'{arch.upper()}_IMAGE_ID'], 'Image differs from validated artifact'
+              assert image['Architecture'] == arch and image['Os'] == 'linux', 'Unexpected image platform'
+              assert image['Config']['User'] == '10001:10001', 'Unexpected runtime identity'
+              assert image['Config']['Entrypoint'] == ['/app/telegram-bots'], 'Unexpected entrypoint'
+              labels = image['Config']['Labels']
+              assert labels['org.opencontainers.image.revision'] == os.environ['GITHUB_SHA'], 'Unexpected source'
+              assert labels['org.opencontainers.image.version'] == os.environ['VERSION'], 'Unexpected version'
+          PY
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069
+      - name: Sign in to Docker Hub
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Verify registry version ownership
+        run: |
+          python3 - <<'PYREGISTRY'
+          import json, os, urllib.error, urllib.parse, urllib.request
+          image = os.environ['IMAGE']
+          query = urllib.parse.urlencode({'service': 'registry.docker.io', 'scope': f'repository:{image}:pull'})
+          with urllib.request.urlopen(f'https://auth.docker.io/token?{query}', timeout=30) as response:
+              token = json.load(response)['token']
+          def manifest(reference):
+              """业务作用：读取远端镜像身份，区分不存在与无法确认。
+              参数说明：reference 是待核对的标签或内容摘要。
+              返回：存在时返回清单，仅 HTTP 404 返回 None，其余失败停止发布。
+              """
+              request = urllib.request.Request(
+                  f'https://registry-1.docker.io/v2/{image}/manifests/{reference}',
+                  headers={'Authorization': f'Bearer {token}', 'Accept': 'application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json'})
+              try:
+                  with urllib.request.urlopen(request, timeout=30) as response:
+                      return json.load(response)
+              except urllib.error.HTTPError as error:
+                  if error.code == 404:
+                      return None
+                  raise SystemExit(f'Registry preflight failed: HTTP {error.code}')
+          expected = {arch: os.environ[f'{arch.upper()}_IMAGE_ID'] for arch in ['amd64', 'arm64']}
+          version = manifest(os.environ['VERSION'])
+          if version is not None:
+              # 已存在的内容只能用于继续完成同一发布，不能替换已公开版本。
+              entries = version.get('manifests', [])
+              assert sorted((entry['platform']['os'], entry['platform']['architecture']) for entry in entries) == [('linux', 'amd64'), ('linux', 'arm64')], 'Existing version platforms differ'
+              for entry in entries:
+                  arch = entry['platform']['architecture']
+                  assert manifest(entry['digest'])['config']['digest'] == expected[arch], 'Existing version content differs; choose a new version'
+          for arch in expected:
+              existing = manifest(f'sha-{os.environ["GITHUB_SHA"]}-{arch}')
+              assert existing is None or existing['config']['digest'] == expected[arch], 'Existing architecture image differs'
+          with open(os.environ['GITHUB_ENV'], 'a') as output:
+              output.write(f'PUBLISH_VERSION={"true" if version is None else "false"}\n')
+          PYREGISTRY
+      - name: Upload exact images and version manifest
+        if: env.PUBLISH_VERSION == 'true'
+        run: |
+          for arch in amd64 arm64; do
+            source="telegram-bots:build-${GITHUB_SHA}-${arch}"
+            target="${IMAGE}:sha-${GITHUB_SHA}-${arch}"
+            docker tag "$source" "$target"
+            docker push "$target"
+          done
+          docker buildx imagetools create --tag "${IMAGE}:${VERSION}" \
+            "${IMAGE}:sha-${GITHUB_SHA}-amd64" "${IMAGE}:sha-${GITHUB_SHA}-arm64"
+          docker buildx imagetools inspect --raw "${IMAGE}:${VERSION}" > version-manifest.json
+          python3 - <<'PY'
+          import json
+          with open('version-manifest.json') as source:
+              manifests = json.load(source)['manifests']
+          assert sorted((item['platform']['os'], item['platform']['architecture']) for item in manifests) == [('linux', 'amd64'), ('linux', 'arm64')]
+          PY
+      - name: Publish repository overview
+        env:
+          HUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+          HUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          python3 - <<'PY'
+          import json, os, urllib.request
+          from pathlib import Path
+          credentials = {'identifier': os.environ['HUB_USERNAME'], 'secret': os.environ['HUB_TOKEN']}
+          request = urllib.request.Request('https://hub.docker.com/v2/auth/token', data=json.dumps(credentials).encode(), headers={'Content-Type': 'application/json'})
+          with urllib.request.urlopen(request, timeout=30) as response:
+              token = json.load(response)['access_token']
+          print(f'::add-mask::{token}')
+          overview = Path('docker/README.md').read_text()
+          description = 'Rust Telegram notification gateway with hot reload, authentication and per-bot message ordering.'
+          url = f'https://hub.docker.com/v2/repositories/{os.environ["IMAGE"]}/'
+          request = urllib.request.Request(url, data=json.dumps({'description': description, 'full_description': overview}).encode(), headers={'Content-Type': 'application/json', 'Authorization': f'Bearer {token}'}, method='PATCH')
+          with urllib.request.urlopen(request, timeout=30):
+              pass
+          request = urllib.request.Request(url, headers={'Authorization': f'Bearer {token}'})
+          with urllib.request.urlopen(request, timeout=30) as response:
+              result = json.load(response)
+          assert result['full_description'] == overview, 'Docker Hub overview differs'
+          assert result['description'] == description, 'Docker Hub summary differs'
+          PY
+      - name: Update latest to the published version
+        run: |
+          docker buildx imagetools create --tag "${IMAGE}:latest" "${IMAGE}:${VERSION}"
+          docker buildx imagetools inspect "${IMAGE}:${VERSION}"
+          docker buildx imagetools inspect "${IMAGE}:latest"
+          printf 'Image: %s:%s\nSource: %s\n' "$IMAGE" "$VERSION" "$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"

@@ -7,7 +7,7 @@
 ```yaml
 yml:
   imports:
-    - file: ${TELEGRAM_YML:/etc/conf/telegram*.yml}
+    - file: ${TELEGRAM_YML:/etc/telegram-bots/*.yml}
       optional: false
 config_watch:
   enabled: true
@@ -16,7 +16,7 @@ catalog_watch:
   load_timeout_ms: 3000
 ```
 
-本服务默认匹配 `/etc/conf/telegram*.yml`，原单文件 `/etc/conf/telegram-bots.yml` 也在该范围内。设置 `TELEGRAM_YML` 可选择其它绝对精确路径或单目录模式，也可以通过启动 profile 覆盖来源声明；来源权限在启动后固定。
+本服务默认匹配 `/etc/telegram-bots/*.yml`，可在该目录放置单个 `telegram-bots.yml` 或多个 `.yml` 文件。设置 `TELEGRAM_YML` 可选择其它绝对精确路径或单目录模式，也可以通过启动 profile 覆盖来源声明；来源权限在启动后固定。
 
 目录路径和模式必须显式以 `.yml` 或 `.yaml` 结尾；可选文件缺失或可选模式零匹配也不会跳过扩展名校验。profile 文件另按 naml 的格式选择规则处理，不受目录文件的 YAML 限制。
 

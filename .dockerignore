@@ -8,3 +8,5 @@
 !zcf/application-nacos.yml
 !LICENSE-MIT
 !LICENSE-APACHE
+!docker
+!docker/Dockerfile

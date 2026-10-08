@@ -2,12 +2,13 @@
 
 ## 镜像与挂载
 
-容器部署需要部署方自行构建并提供镜像。使用 Rust 1.94 或更新版本和仓库锁文件，为目标 Linux 架构构建 `telegram-bots`；镜像中放置 `/app/telegram-bots`、匹配的运行库、CA 证书、许可证和 `/app/zcf/` 下的引导文件。机器人目录和凭据从只读挂载读取，不进入镜像层。
+镜像地址为 [nasaruntime/telegram-bots](https://hub.docker.com/r/nasaruntime/telegram-bots)，支持 `linux/amd64` 和 `linux/arm64`。使用明确版本 `1.0.0`，需要固定内容时使用镜像 digest；`latest` 跟随最新发布内容。
 
-下面的 Docker 与 Kubernetes 示例约定运行身份为非 root 用户 `10001:10001`、运行目录为 `/app`，启动命令为 `/app/telegram-bots`。镜像构建者需要保证该用户可执行程序、读取引导文件，并按这些路径准备镜像；将示例镜像地址替换为实际地址。
+[docker/Dockerfile](../docker/Dockerfile) 使用 Alpine 分阶段构建，Rust musl 编译启用体积优化、LTO 和符号裁剪。运行层只包含 Alpine、CA 证书、程序、许可证和引导文件，不携带编译器、源码、依赖缓存或机器人凭据。运行身份为非 root 用户 `10001:10001`，工作目录为 `/app`，启动命令为 `/app/telegram-bots`。
 
 ```sh
-export TELEGRAM_BOTS_IMAGE=YOUR_REGISTRY/telegram-bots:YOUR_IMAGE_TAG
+export TELEGRAM_BOTS_IMAGE=nasaruntime/telegram-bots:1.0.0
+docker pull "$TELEGRAM_BOTS_IMAGE"
 mkdir -p deploy-local/config deploy-local/secrets
 cp examples/catalog-empty.yml deploy-local/config/telegram-bots.yml
 docker run --detach --name telegram-bots \
@@ -15,7 +16,7 @@ docker run --detach --name telegram-bots \
   --read-only --cap-drop ALL --security-opt no-new-privileges \
   --env TELEGRAM_LOG_PATH= \
   --publish 127.0.0.1:2060:2060 \
-  --mount "type=bind,src=$PWD/deploy-local/config,dst=/etc/conf,readonly" \
+  --mount "type=bind,src=$PWD/deploy-local/config,dst=/etc/telegram-bots,readonly" \
   --mount "type=bind,src=$PWD/deploy-local/secrets,dst=/run/secrets,readonly" \
   "$TELEGRAM_BOTS_IMAGE"
 ```
@@ -24,7 +25,7 @@ docker run --detach --name telegram-bots \
 
 必须挂载**目录**。宿主机原子替换单个文件时，单文件 bind mount 可能仍指向旧 inode；目录挂载可以看到替换后的路径。不要覆盖 `/app/zcf/application.yml`。
 
-基于 [catalog.yml](../examples/catalog.yml) 生成业务目录并填入真实目的地和凭据文件摘要；将 `generation` 增加到 `2`，通过同目录重命名替换 `/etc/conf/telegram-bots.yml`。以后每次变更递增代号。更新凭据文件时同时更新 YAML 摘要；过渡期目录会被拒绝，旧目录继续服务，匹配后自动应用。
+基于 [catalog.yml](../examples/catalog.yml) 生成业务目录并填入真实目的地和凭据文件摘要；将 `generation` 增加到 `2`，通过同目录重命名替换 `/etc/telegram-bots/telegram-bots.yml`。以后每次变更递增代号。更新凭据文件时同时更新 YAML 摘要；过渡期目录会被拒绝，旧目录继续服务，匹配后自动应用。
 
 根文件系统可以只读，无需持久化消息数据卷。容器平台可以使用 HTTP 探针；自行添加 Docker HEALTHCHECK 时，应根据 `/readyz` 的实际 HTTP 状态判断就绪。镜像构建者负责固定基础镜像 digest、漏洞管理、SBOM 和来源记录。
 
@@ -65,7 +66,7 @@ spec:
         fsGroup: 10001
       containers:
         - name: telegram-bots
-          image: YOUR_REGISTRY/telegram-bots:YOUR_IMAGE_TAG
+          image: nasaruntime/telegram-bots:1.0.0
           workingDir: /app
           command: ["/app/telegram-bots"]
           env:
@@ -96,7 +97,7 @@ spec:
             httpGet: {path: /healthz, port: http}
             periodSeconds: 10
           volumeMounts:
-            - {name: catalog, mountPath: /etc/conf, readOnly: true}
+            - {name: catalog, mountPath: /etc/telegram-bots, readOnly: true}
             - {name: materials, mountPath: /run/secrets, readOnly: true}
       volumes:
         - name: catalog
@@ -134,4 +135,20 @@ spec:
 
 Nacos 只发布实例寻址信息。它不读取 bot YAML，不提供跨实例队列协调，也不替代 HTTP Bearer 认证。来源和 Nacos profile 在启动时固定，调整它们需要重启。
 
-默认来源模式为 `/etc/conf/telegram*.yml`，单文件部署继续使用 `telegram-bots.yml` 即可。拆分多文件时，每份 YAML 都声明相同 generation，更新时递增整个集合；临时文件使用不匹配后缀再 rename。日志默认目录按 `${application.name}` 展开，容器挂载必须覆盖展开后的路径，环境显式空值关闭文件输出。
+默认来源模式为 `/etc/telegram-bots/*.yml`，单文件部署继续使用 `telegram-bots.yml` 即可。拆分多文件时，每份 YAML 都声明相同 generation，更新时递增整个集合；临时文件使用不匹配后缀再 rename。日志默认目录按 `${application.name}` 展开，容器挂载必须覆盖展开后的路径，环境显式空值关闭文件输出。
+
+## 从源码构建
+
+在仓库根目录执行，构建上下文由 `.dockerignore` 限定为程序和必要配置，不会包含本地凭据或运行目录：
+
+```sh
+docker build --file docker/Dockerfile --tag telegram-bots:local .
+```
+
+默认构建当前主机架构；其它架构由 Docker Buildx 的 `--platform` 指定。构建需要访问基础镜像仓库、Alpine 软件源及 crates.io。基础镜像按 digest 固定，Rust 依赖按 `Cargo.lock` 固定。
+
+## 镜像发布
+
+`release` 分支的 Rust 工作流在编译与文档检查成功后，为 amd64、arm64 分别构建镜像归档。`Publish Docker image` 工作流从这些归档发布，不在上传阶段重新构建。手动运行时选择 `release`，提供成功的构建 run ID 和两个已确认的 image ID；流程会核对来源提交、分支、平台、版本和镜像身份，拒绝覆盖已有版本标签。
+
+GitHub Actions 使用 Secret `DOCKERHUB_TOKEN`、Variable `DOCKERHUB_USERNAME`。个人仓库默认以用户名作为 namespace；`DOCKERHUB_NAMESPACE` 可显式指定，本项目目标为 `nasaruntime/telegram-bots`。Token 需要镜像推送与仓库说明更新权限。镜像版本取自 `Cargo.toml`；发布过程同时更新 Docker Hub 概览，最后让 `latest` 指向该版本。若版本已上传而后续步骤失败，需按远端现状处理，不能通过覆盖版本标签掩盖部分完成状态。

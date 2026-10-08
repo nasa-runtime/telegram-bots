@@ -12,7 +12,7 @@ cargo doc --locked --no-deps
 cargo package --locked --allow-dirty
 ```
 
-本服务以源码和业务方构建的容器交付，manifest 设置 `publish = false`。打包可用于检查源码制品中的 README、配置、许可证及文件清单，不表示发布到 registry。
+本服务以源码和 Docker Hub 容器镜像交付，manifest 设置 `publish = false`。打包可用于检查源码制品中的 README、配置、许可证及文件清单，不表示发布到 registry。
 
 产品只有 `src/main.rs` 对应的 `telegram-bots` 可执行文件。准备好外部配置和本地 profile 后可直接 `cargo run --locked`，所有必要能力随主程序交付。
 

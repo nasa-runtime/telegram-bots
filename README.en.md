@@ -72,11 +72,52 @@ export TELEGRAM_LOG_PATH="$PWD/logs"
 ./target/release/telegram-bots
 ```
 
-The build produces the `telegram-bots` executable. After preparing the configuration and environment variables above, use `cargo run --locked` for development. Configure the same absolute `TELEGRAM_YML` path and a writable `TELEGRAM_LOG_PATH` directory in your IDE, and use the project root as its working directory. Without `TELEGRAM_YML`, the service matches `/etc/conf/telegram*.yml`; no matches prevent startup. An exact absolute file path is also accepted.
+The build produces the `telegram-bots` executable. After preparing the configuration and environment variables above, use `cargo run --locked` for development. Configure the same absolute `TELEGRAM_YML` path and a writable `TELEGRAM_LOG_PATH` directory in your IDE, and use the project root as its working directory. Without `TELEGRAM_YML`, the service matches `/etc/telegram-bots/*.yml`; no matches prevent startup. An exact absolute file path is also accepted.
 
 The default listener is `0.0.0.0:2060`. Check `/readyz` and `/metrics` from an internal network. An empty catalog can start, but has no authenticated business callers.
 
-Container deployment requires an image built and supplied by the operator, with an immutable `/app/zcf/application.yml` bootstrap. The service matches `/etc/conf/telegram*.yml` by default. `TELEGRAM_YML` can select another absolute path at startup. Mount configuration and credentials as directories, not individual files. See [container deployment](docs/container-deployment.md) for image requirements and Docker and Kubernetes examples, including non-root operation and read-only mounts.
+The Docker Hub image is `nasaruntime/telegram-bots`, with an immutable `/app/zcf/application.yml` bootstrap. Mount your configuration directory at `/etc/telegram-bots`. The service matches `/etc/telegram-bots/*.yml` by default. `TELEGRAM_YML` can select another absolute path at startup. Mount configuration and credentials as directories, not individual files. See [container deployment](docs/container-deployment.md) for image requirements and Docker and Kubernetes examples, including non-root operation and read-only mounts.
+
+## Run with Docker
+
+Image: [`nasaruntime/telegram-bots:1.0.0`](https://hub.docker.com/r/nasaruntime/telegram-bots). It uses Alpine, supports `linux/amd64` and `linux/arm64`, and runs as UID/GID `10001:10001`. The import expression is `${TELEGRAM_YML:/etc/telegram-bots/*.yml}`: mount the whole configuration directory at `/etc/telegram-bots`.
+
+This minimal configuration starts an empty catalog and exposes readiness. Sending messages requires bots, destinations, callers and credential files:
+
+```sh
+mkdir -p deploy-local/config deploy-local/secrets
+cat > deploy-local/config/telegram-bots.yml <<'YAML'
+generation: 1
+telegram:
+  bots: {}
+  clients: {}
+secrets: {}
+YAML
+
+docker run --detach --name telegram-bots \
+  --read-only --cap-drop ALL --security-opt no-new-privileges \
+  --env TELEGRAM_LOG_PATH= \
+  --publish 127.0.0.1:2060:2060 \
+  --mount "type=bind,src=$PWD/deploy-local/config,dst=/etc/telegram-bots,readonly" \
+  --mount "type=bind,src=$PWD/deploy-local/secrets,dst=/run/secrets,readonly" \
+  nasaruntime/telegram-bots:1.0.0
+
+curl --fail http://127.0.0.1:2060/readyz
+docker logs --tail 100 telegram-bots
+```
+| Mount or setting | Purpose |
+| --- | --- |
+| `/etc/telegram-bots`, read-only directory | Load all `.yml` files in natural filename order; later files override earlier ones; at least one file is required |
+| `/run/secrets`, read-only directory | Bot tokens and caller credentials referenced by `secrets.*.file` and SHA-256 |
+| `TELEGRAM_LOG_PATH=` | Console logging only, suitable for a read-only root filesystem |
+| `/usr/local/logs/telegram-bots`, writable directory | Mount for default file logging and remove the empty `TELEGRAM_LOG_PATH` setting |
+| `127.0.0.1:2060:2060` | Host-local access; callers on the same container network can use `http://telegram-bots:2060` |
+
+Use [catalog.yml](examples/catalog.yml) to configure real bots and callers. Credential files must be readable by UID 10001 or its controlled group. Increase `generation` for each change, using the same generation in every imported file. Write temporary files with a suffix that does not match `.yml`, then atomically rename them. Mount directories rather than individual files, and retain the image's `/app/zcf/application.yml`. Set `TELEGRAM_YML` to override the default absolute path or filename pattern.
+
+`/healthz` and `/readyz` use actual HTTP statuses. Business `/api/` responses use HTTP 200 and require checking JSON `code`; successful message acceptance only means entry into an in-memory queue. Stop with `docker stop --time 70 telegram-bots` to allow draining.
+
+Build from source with `docker build -f docker/Dockerfile -t telegram-bots:local .`; the [Dockerfile](docker/Dockerfile) is included in the repository. See [container deployment](docs/container-deployment.md) for log mounts, Kubernetes, Nacos and publication settings.
 
 ## Configure a bot
 
@@ -88,7 +129,7 @@ Set `generation` to an integer in `1..=9007199254740991`, greater than the appli
 
 The default poll interval is one second. Publication requires two consecutive matching complete reads. With normal scheduling and fast local file reads, a stable change usually takes about one to two seconds to apply, plus reading and validation time. Check the configuration status if a stable visible change remains unapplied after ten seconds; this is an operational threshold, not a guaranteed maximum delay. External catalog and credential reads execute in a separate helper process during both initialization and runtime. The default read budget is three seconds, followed by at most one second to terminate and reap the helper. Runtime timeouts retain the working catalog and subsequent polls retry; startup timeouts exit without opening the listener. Failure to reap the helper stops the service. Platform projection delays or mismatched credentials can extend the wait.
 
-Imports are explicit lists of absolute `file` paths or single-directory filename patterns, each with an explicit `optional` flag. Patterns such as `/etc/conf/telegram*.yml` load files in natural filename order; later files override earlier files. Recursive imports, directory wildcards and inline secret material are unsupported. Unknown fields fail closed. See the [configuration reference](docs/configuration.md) for all fields, precedence and limits.
+Imports are explicit lists of absolute `file` paths or single-directory filename patterns, each with an explicit `optional` flag. Patterns such as `/etc/telegram-bots/*.yml` load files in natural filename order; later files override earlier files. Recursive imports, directory wildcards and inline secret material are unsupported. Unknown fields fail closed. See the [configuration reference](docs/configuration.md) for all fields, precedence and limits.
 
 ## Calling from a business service
 
@@ -255,7 +296,7 @@ See [contribution guidance](CONTRIBUTING.md). Licensed under either [MIT](LICENS
 
 ## Ordered files and nested defaults
 
-`yml.imports` accepts filename `*` and `?` within one fixed directory. Each declaration is expanded separately in natural filename order: `telegram-1.yml`, `telegram-2.yml`, `telegram-02.yml`, `telegram-10.yml`. Later files override earlier files, and environment overrides apply last. Quote patterns in shell assignments, for example `TELEGRAM_YML='/etc/conf/telegram*.yml'`. Recursive patterns, directory wildcards and nested imports are rejected.
+`yml.imports` accepts filename `*` and `?` within one fixed directory. Each declaration is expanded separately in natural filename order: `telegram-1.yml`, `telegram-2.yml`, `telegram-02.yml`, `telegram-10.yml`. Later files override earlier files, and environment overrides apply last. Quote patterns in shell assignments, for example `TELEGRAM_YML='/etc/telegram-bots/*.yml'`. Recursive patterns, directory wildcards and nested imports are rejected.
 
 Every matched source must be a regular YAML file and declare the same generation. Changes to the resolved configuration require a higher generation across the complete set. Renaming a source without changing the resolved values is still revalidated on every polling cycle and does not create new consumers. Directory enumeration, reads and source revalidation share the existing terminable reader process and deadline. Invalid content, mixed generations, duplicate file identities or credential digest mismatches keep the previous catalog active. Bootstrap source declarations and profile changes require a restart.
 

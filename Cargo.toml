@@ -9,7 +9,7 @@ description = "Telegram notification gateway with atomic catalog reloads, bounde
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/nasa-runtime/telegram-bots"
-include = ["/Cargo.toml", "/Cargo.lock", "/README*.md", "/SECURITY.md", "/CONTRIBUTING.md", "/LICENSE-*", "/docs/**", "/examples/**", "/.dockerignore", "/src/**", "/zcf/application.yml", "/zcf/application-nacos.yml"]
+include = ["/Cargo.toml", "/Cargo.lock", "/README*.md", "/SECURITY.md", "/CONTRIBUTING.md", "/LICENSE-*", "/docs/**", "/examples/**", "/docker/Dockerfile", "/docker/README.md", "/.dockerignore", "/src/**", "/zcf/application.yml", "/zcf/application-nacos.yml"]
 
 [dependencies]
 anyhow = "1"

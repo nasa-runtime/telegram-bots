@@ -1,6 +1,8 @@
 /target/
 /tests/
 /logs/
+/deploy-local/
+/zcf/application-local.yml
 /.idea/
 /.claude/
 /.cc-writes/
