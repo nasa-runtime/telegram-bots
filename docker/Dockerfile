@@ -1,4 +1,4 @@
-FROM rust:1.94-alpine@sha256:77237dd363a0b127bb5ef532c2d64c0deb380b738e43a9c4bdac73398d6d0a08 AS builder
+FROM docker.io/library/rust:1.94-alpine@sha256:77237dd363a0b127bb5ef532c2d64c0deb380b738e43a9c4bdac73398d6d0a08 AS builder
 RUN apk add --no-cache musl-dev
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
@@ -9,7 +9,7 @@ RUN cargo build --locked --release --bin telegram-bots -j 2 \
     --config 'profile.release.codegen-units=1' \
     --config 'profile.release.strip="symbols"'
 
-FROM alpine:3.23@sha256:85fe1e81d6758c208f3e1eed4338a1997e19d4be002d4dd32d3100c9a8c010a0 AS runtime
+FROM docker.io/library/alpine:3.23@sha256:85fe1e81d6758c208f3e1eed4338a1997e19d4be002d4dd32d3100c9a8c010a0 AS runtime
 ARG APP_VERSION=1.0.0
 ARG SOURCE_REVISION=unknown
 LABEL org.opencontainers.image.title="telegram-bots" \
