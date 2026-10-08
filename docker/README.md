@@ -25,7 +25,10 @@ secrets: {}
 YAML
 
 docker run --detach --name telegram-bots \
+  --restart unless-stopped --stop-timeout 70 \
   --read-only --cap-drop ALL --security-opt no-new-privileges \
+  --log-driver json-file --log-opt max-size=10m --log-opt max-file=3 \
+  --env APP_PROFILE= --env APP__REST_DISCOVERY__ENABLED=false \
   --env TELEGRAM_LOG_PATH= \
   --publish 127.0.0.1:2060:2060 \
   --mount "type=bind,src=$PWD/deploy-local/config,dst=/etc/telegram-bots,readonly" \
@@ -38,6 +41,16 @@ docker logs --tail 100 telegram-bots
 此示例包含空业务目录，服务可就绪，但尚未配置机器人与调用凭据。参照 [配置模板](https://github.com/nasa-runtime/telegram-bots/blob/release/examples/catalog.yml) 填写机器人、目的地、调用方、凭据路径和 SHA-256。真实凭据保存在 `/run/secrets` 的只读目录挂载中，允许 UID 10001 或受控组读取。
 
 The starter catalog has no bots or authenticated callers. Configure them using the [catalog template](https://github.com/nasa-runtime/telegram-bots/blob/release/examples/catalog.yml). Mount credential files read-only at `/run/secrets` and reference their paths and SHA-256 hashes in YAML.
+
+## Nacos 注册发现 / Nacos discovery
+
+上例不使用 Nacos。启用时保留同样的 YAML 与凭据目录挂载，设置 `APP_PROFILE=nacos`、`APP__REST_DISCOVERY__ENABLED=true`、`NACOS_SERVER_ADDR` 和 `TELEGRAM_REGISTER_IP`。可选参数为 `NACOS_NAMESPACE`（namespace ID，默认空）、`NACOS_GROUP`（默认 `DEFAULT_GROUP`）以及成对的 `NACOS_USERNAME`、`NACOS_PASSWORD`。Nacos 只负责注册发现，不读取机器人配置。
+
+注册 IP 和 `APP__REST_DISCOVERY__REGISTRATION__PORT` 必须组成业务方可达的地址；注册端口默认跟随容器 listener，不会自动推导宿主机映射。主机映射 `12060:2060` 时注册端口应为 `12060`。切换启动方式前先停止旧实例，避免同一 bot 被两个实例发送。
+
+For Nacos, use the bundled `nacos` profile and supply its SDK endpoint, namespace/group, credentials and a caller-reachable registration IP. Match the registered port to the published host port. Bot configuration remains in the mounted YAML directory.
+
+完整环境文件、网络与端口参数及两套可执行启动命令：[中文说明](https://github.com/nasa-runtime/telegram-bots/blob/release/README.md#docker-启动)、[English instructions](https://github.com/nasa-runtime/telegram-bots/blob/release/README.en.md#run-with-docker)。
 
 ## 配置与运行边界 / Configuration and limits
 

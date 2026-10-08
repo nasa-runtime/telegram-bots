@@ -474,6 +474,7 @@ pub fn bootstrap_loader() -> nasa::yml::strict::Result<ConfigLoader> {
                 "server.health",
                 "server.graceful_shutdown_timeout_ms",
                 "rest_discovery.enabled",
+                "rest_discovery.registration.port",
                 "config_watch.enabled",
                 "catalog_watch.poll_interval_ms",
                 "catalog_watch.load_timeout_ms",

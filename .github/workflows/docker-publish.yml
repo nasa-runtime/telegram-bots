@@ -7,12 +7,12 @@ on:
         description: Successful release Rust workflow run containing the image archives
         required: true
         type: string
-      amd64_image_id:
-        description: Validated amd64 image ID including sha256 prefix
+      amd64_config_digest:
+        description: Validated amd64 archive config digest including sha256 prefix
         required: true
         type: string
-      arm64_image_id:
-        description: Validated arm64 image ID including sha256 prefix
+      arm64_config_digest:
+        description: Validated arm64 archive config digest including sha256 prefix
         required: true
         type: string
 
@@ -32,8 +32,8 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       BUILD_RUN_ID: ${{ inputs.build_run_id }}
-      AMD64_IMAGE_ID: ${{ inputs.amd64_image_id }}
-      ARM64_IMAGE_ID: ${{ inputs.arm64_image_id }}
+      AMD64_CONFIG_DIGEST: ${{ inputs.amd64_config_digest }}
+      ARM64_CONFIG_DIGEST: ${{ inputs.arm64_config_digest }}
       HUB_NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE || vars.DOCKERHUB_USERNAME }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -44,8 +44,8 @@ jobs:
           from pathlib import Path
           run_id = os.environ['BUILD_RUN_ID']
           assert re.fullmatch(r'[0-9]+', run_id), 'Invalid build run ID'
-          for name in ['AMD64_IMAGE_ID', 'ARM64_IMAGE_ID']:
-              assert re.fullmatch(r'sha256:[a-f0-9]{64}', os.environ[name]), 'Invalid image ID'
+          for name in ['AMD64_CONFIG_DIGEST', 'ARM64_CONFIG_DIGEST']:
+              assert re.fullmatch(r'sha256:[a-f0-9]{64}', os.environ[name]), 'Invalid config digest'
           repo, sha = os.environ['GITHUB_REPOSITORY'], os.environ['GITHUB_SHA']
           run = json.loads(subprocess.check_output(['gh', 'api', f'repos/{repo}/actions/runs/{run_id}']))
           assert run['head_sha'] == sha and run['head_branch'] == 'release', 'Source revision differs'
@@ -75,20 +75,31 @@ jobs:
           path: image-archives
       - name: Verify exact image identities
         run: |
-          python3 - <<'PY'
-          import json, os, subprocess
+          python3 - <<'PYIDENTITY'
+          import hashlib, json, os, subprocess, tarfile
           for arch in ['amd64', 'arm64']:
-              subprocess.run(['docker', 'load', '--input', f'image-archives/telegram-bots-{arch}.tar'], check=True)
+              archive = f'image-archives/telegram-bots-{arch}.tar'
               tag = f'telegram-bots:build-{os.environ["GITHUB_SHA"]}-{arch}'
+              # 配置摘要绑定运行参数与全部文件系统层，不依赖 Docker 存储后端的 ID 表示。
+              with tarfile.open(archive) as source:
+                  entries = json.load(source.extractfile('manifest.json'))
+                  assert len(entries) == 1 and entries[0]['RepoTags'] == [tag], 'Unexpected archive tags'
+                  raw = source.extractfile(entries[0]['Config']).read()
+                  assert 'sha256:' + hashlib.sha256(raw).hexdigest() == os.environ[f'{arch.upper()}_CONFIG_DIGEST'], 'Archive differs from validated artifact'
+                  config = json.loads(raw)
+              subprocess.run(['docker', 'load', '--input', archive], check=True)
               image = json.loads(subprocess.check_output(['docker', 'image', 'inspect', tag]))[0]
-              assert image['Id'] == os.environ[f'{arch.upper()}_IMAGE_ID'], 'Image differs from validated artifact'
+              assert image['RootFS']['Type'] == config['rootfs']['type'] and image['RootFS']['Layers'] == config['rootfs']['diff_ids'], 'Loaded image layers differ'
+              for field in ['User', 'Env', 'Entrypoint', 'Cmd', 'WorkingDir', 'Labels', 'StopSignal', 'ExposedPorts']:
+                  assert image['Config'].get(field) == config['config'].get(field), f'Loaded image {field} differs'
               assert image['Architecture'] == arch and image['Os'] == 'linux', 'Unexpected image platform'
+              assert config['architecture'] == arch and config['os'] == 'linux', 'Unexpected archive platform'
               assert image['Config']['User'] == '10001:10001', 'Unexpected runtime identity'
               assert image['Config']['Entrypoint'] == ['/app/telegram-bots'], 'Unexpected entrypoint'
               labels = image['Config']['Labels']
               assert labels['org.opencontainers.image.revision'] == os.environ['GITHUB_SHA'], 'Unexpected source'
               assert labels['org.opencontainers.image.version'] == os.environ['VERSION'], 'Unexpected version'
-          PY
+          PYIDENTITY
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069
       - name: Sign in to Docker Hub
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f
@@ -118,7 +129,7 @@ jobs:
                   if error.code == 404:
                       return None
                   raise SystemExit(f'Registry preflight failed: HTTP {error.code}')
-          expected = {arch: os.environ[f'{arch.upper()}_IMAGE_ID'] for arch in ['amd64', 'arm64']}
+          expected = {arch: os.environ[f'{arch.upper()}_CONFIG_DIGEST'] for arch in ['amd64', 'arm64']}
           version = manifest(os.environ['VERSION'])
           if version is not None:
               # 已存在的内容只能用于继续完成同一发布，不能替换已公开版本。

@@ -82,7 +82,11 @@ The Docker Hub image is `nasaruntime/telegram-bots`, with an immutable `/app/zcf
 
 Image: [`nasaruntime/telegram-bots:1.0.0`](https://hub.docker.com/r/nasaruntime/telegram-bots). It uses Alpine, supports `linux/amd64` and `linux/arm64`, and runs as UID/GID `10001:10001`. The import expression is `${TELEGRAM_YML:/etc/telegram-bots/*.yml}`: mount the whole configuration directory at `/etc/telegram-bots`.
 
-This minimal configuration starts an empty catalog and exposes readiness. Sending messages requires bots, destinations, callers and credential files:
+`linux/amd64` means x64/x86_64 for both Intel and AMD processors. The same tag also supports `linux/arm64`; Docker chooses the host architecture automatically.
+
+### Prepare the configuration directory
+
+Both startup modes use the following files. Run commands from the same working directory, and retain any existing business configuration. This empty catalog can become ready; sending messages requires bots, destinations, callers and credential files as described under “Configure a bot”.
 
 ```sh
 mkdir -p deploy-local/config deploy-local/secrets
@@ -93,9 +97,26 @@ telegram:
   clients: {}
 secrets: {}
 YAML
+```
+
+The configuration directory and YAML must be readable by UID 10001. Restrict credential files to that user or a controlled group. Reference credentials as `/run/secrets/<filename>` and calculate SHA-256 over the original file bytes. Use [catalog.yml](examples/catalog.yml) for a complete business template. Nacos, logging and listener settings belong to startup configuration, not these business YAML files.
+
+### Without Nacos
+
+Nacos is disabled by default. This command explicitly clears the profile and disables discovery; no Nacos parameters are required. A custom network allows other containers on that network to call `http://telegram-bots:2060`. Skip network creation if it already exists.
+
+```sh
+docker network create telegram-bots-net
+docker pull nasaruntime/telegram-bots:1.0.0
 
 docker run --detach --name telegram-bots \
+  --network telegram-bots-net \
+  --restart unless-stopped --stop-timeout 70 \
   --read-only --cap-drop ALL --security-opt no-new-privileges \
+  --log-driver json-file --log-opt max-size=10m --log-opt max-file=3 \
+  --env APP_PROFILE= --env APP__REST_DISCOVERY__ENABLED=false \
+  --env 'TELEGRAM_YML=/etc/telegram-bots/*.yml' \
+  --env APP__SERVER__PORT=2060 --env TELEGRAM_LOG_LEVEL=info \
   --env TELEGRAM_LOG_PATH= \
   --publish 127.0.0.1:2060:2060 \
   --mount "type=bind,src=$PWD/deploy-local/config,dst=/etc/telegram-bots,readonly" \
@@ -105,15 +126,98 @@ docker run --detach --name telegram-bots \
 curl --fail http://127.0.0.1:2060/readyz
 docker logs --tail 100 telegram-bots
 ```
-| Mount or setting | Purpose |
+
+Host processes use `http://127.0.0.1:2060`. Other servers cannot reach this loopback mapping. For remote clients, publish on a reachable private host IP, such as `--publish 192.168.10.20:2060:2060`, restrict incoming traffic, and use a TLS proxy across trust boundaries. `0.0.0.0` is a bind address, not a client destination.
+
+### With Nacos discovery
+
+Use the same image and the same configuration and credential mounts. `APP_PROFILE=nacos` loads the bundled `zcf/application-nacos.yml`. Nacos **only provides registration and discovery**; bot configuration still comes from `/etc/telegram-bots/*.yml`. No Nacos configuration Data ID is required.
+
+The example uses gateway host IP `192.168.10.20` and Nacos SDK address `192.168.10.10:8848`; replace both with your deployment values. The container must reach Nacos, and business callers must reach the registered IP. Inside a container, `127.0.0.1` does not refer to the host. Docker Desktop can reach host Nacos at `host.docker.internal:8848`; Linux can use `--add-host host.docker.internal:host-gateway` when needed. Use the SDK `host:port`, not a console URL or `/nacos` path. Clients normally also need access to SDK gRPC port `9848`, the default SDK port plus 1000. See the [Nacos deployment reference](https://nacos.io/en/docs/next/manual/admin/deployment/deployment-overview/).
+
+Create a restricted environment file in the working directory prepared above. Edit it to supply the actual endpoint, credentials and namespace:
+
+```sh
+umask 077
+cat > deploy-local/nacos.env <<'ENV'
+NACOS_SERVER_ADDR=192.168.10.10:8848
+NACOS_NAMESPACE=
+NACOS_GROUP=DEFAULT_GROUP
+NACOS_USERNAME=REPLACE_WITH_USERNAME
+NACOS_PASSWORD=REPLACE_WITH_PASSWORD
+ENV
+chmod 600 deploy-local/nacos.env
+```
+
+`NACOS_NAMESPACE` is the namespace **ID**; empty selects the default public namespace. Leave both username and password empty only when Nacos authentication is disabled. Use literal `KEY=value` entries without shell quotes; Docker does not expand `${...}` in this file. Keep it local with restricted permissions and out of Git. Administrators allowed to inspect containers can still read their environment.
+
+Choose one startup mode for a bot catalog. If the previous container is running, first run `docker stop --time 70 telegram-bots` and `docker rm telegram-bots`. Ensure `telegram-bots-net` exists, then start:
+
+```sh
+export TELEGRAM_HOST_IP=192.168.10.20
+docker pull nasaruntime/telegram-bots:1.0.0
+
+docker run --detach --name telegram-bots \
+  --network telegram-bots-net \
+  --restart unless-stopped --stop-timeout 70 \
+  --read-only --cap-drop ALL --security-opt no-new-privileges \
+  --log-driver json-file --log-opt max-size=10m --log-opt max-file=3 \
+  --env-file "$PWD/deploy-local/nacos.env" \
+  --env APP_PROFILE=nacos --env APP__REST_DISCOVERY__ENABLED=true \
+  --env TELEGRAM_REGISTER_IP="$TELEGRAM_HOST_IP" \
+  --env APP__REST_DISCOVERY__REGISTRATION__PORT=2060 \
+  --env 'TELEGRAM_YML=/etc/telegram-bots/*.yml' \
+  --env APP__SERVER__PORT=2060 --env TELEGRAM_LOG_LEVEL=info \
+  --env TELEGRAM_LOG_PATH= \
+  --publish "${TELEGRAM_HOST_IP}:2060:2060" \
+  --mount "type=bind,src=$PWD/deploy-local/config,dst=/etc/telegram-bots,readonly" \
+  --mount "type=bind,src=$PWD/deploy-local/secrets,dst=/run/secrets,readonly" \
+  nasaruntime/telegram-bots:1.0.0
+
+curl --fail "http://${TELEGRAM_HOST_IP}:2060/readyz"
+docker logs --tail 100 telegram-bots
+```
+
+Check the healthy `telegram-bots` instance in the selected Nacos namespace/group. Its expected address is `192.168.10.20:2060`. Business callers discover it and send HTTP requests directly with the required caller headers; Nacos does not proxy messages. Connection or registration failure prevents normal readiness. Check connectivity, account permissions, namespace ID and logs.
+
+Container port, published host port and registered port are separate. For `--publish "${TELEGRAM_HOST_IP}:12060:2060"`, also set `APP__REST_DISCOVERY__REGISTRATION__PORT=12060`; keep `APP__SERVER__PORT=2060`. Otherwise discovery returns the wrong port. Do not register a random Docker bridge IP for callers on other hosts. An unset registration port or value `0` uses the actual listener port; it does not infer Docker port mappings.
+
+### Parameters and mounts
+
+| Parameter or setting | Purpose and default behavior |
 | --- | --- |
+| `--network telegram-bots-net` | Enables name lookup between containers on that network; does not create it or attach callers automatically |
+| `--restart unless-stopped` | Restarts after container exit or Docker restart; explicitly stopped containers stay stopped |
+| `--stop-timeout 70` | Allows 70 seconds for the default 60-second application shutdown budget |
+| `--read-only`, `--cap-drop ALL`, `no-new-privileges` | Read-only root, no Linux capabilities, no privilege escalation; default user is 10001 |
+| `--log-driver json-file` and `--log-opt` | Limits Docker console logs to three files of 10 MiB each, independently of nalog file output |
+| `APP_PROFILE` | Empty loads only the main bootstrap; `nacos` loads the Nacos profile; recreate the container after changes |
+| `APP__REST_DISCOVERY__ENABLED` | Defaults to `false`; the Nacos profile enables registration/discovery |
+| `NACOS_SERVER_ADDR` | Required for Nacos: SDK `host:port` reachable from the container |
+| `NACOS_NAMESPACE`, `NACOS_GROUP` | Empty namespace and `DEFAULT_GROUP` by default; callers must discover in the same scope |
+| `NACOS_USERNAME`, `NACOS_PASSWORD` | Empty by default; configure both according to Nacos authentication requirements |
+| `TELEGRAM_REGISTER_IP` | Required for Nacos: actual IP reachable by callers, not a wildcard bind address |
+| `APP__REST_DISCOVERY__REGISTRATION__PORT` | Default `0` uses the actual listener port; explicitly set the reachable port when publishing through NAT |
+| `LOCAL_NETWORK_IP` | Highest-priority NASA registration IP override; normally omit it so it does not override `TELEGRAM_REGISTER_IP` |
+| `APP__SERVER__PORT`, `--publish` | Default container port 2060; mapping is `host-IP:host-port:container-port`, with the last value matching the listener |
+| `TELEGRAM_YML` | Defaults to `/etc/telegram-bots/*.yml`; supports an absolute file or single-directory pattern; quote `*` in shell arguments |
 | `/etc/telegram-bots`, read-only directory | Load all `.yml` files in natural filename order; later files override earlier ones; at least one file is required |
 | `/run/secrets`, read-only directory | Bot tokens and caller credentials referenced by `secrets.*.file` and SHA-256 |
 | `TELEGRAM_LOG_PATH=` | Console logging only, suitable for a read-only root filesystem |
+| `TELEGRAM_LOG_LEVEL` | Startup log filter level, `info` by default |
 | `/usr/local/logs/telegram-bots`, writable directory | Mount for default file logging and remove the empty `TELEGRAM_LOG_PATH` setting |
-| `127.0.0.1:2060:2060` | Host-local access; callers on the same container network can use `http://telegram-bots:2060` |
 
-Use [catalog.yml](examples/catalog.yml) to configure real bots and callers. Credential files must be readable by UID 10001 or its controlled group. Increase `generation` for each change, using the same generation in every imported file. Write temporary files with a suffix that does not match `.yml`, then atomically rename them. Mount directories rather than individual files, and retain the image's `/app/zcf/application.yml`. Set `TELEGRAM_YML` to override the default absolute path or filename pattern.
+For file logging, prepare a dedicated host directory, remove `--env TELEGRAM_LOG_PATH=` from either command and add `--mount "type=bind,src=$PWD/deploy-local/logs,dst=/usr/local/logs/telegram-bots"`:
+
+```sh
+mkdir -p deploy-local/logs
+sudo chown 10001:10001 deploy-local/logs
+sudo chmod 750 deploy-local/logs
+```
+
+Keep this log mount writable and the configuration/credential mounts read-only. Do not change ownership of an existing shared directory. The container does not create missing configuration: missing directories, zero YAML matches, unreadable credentials or an unwritable default log path prevent startup.
+
+Increase `generation` for every business configuration change, using the same value in every imported file. Write temporary files with a suffix that does not match `.yml`, then atomically rename them. Mount whole directories and retain `/app/zcf/application.yml`. Environment variables, profiles, Nacos and listener settings require container recreation; business YAML and credentials support hot reload under the configuration contract.
 
 `/healthz` and `/readyz` use actual HTTP statuses. Business `/api/` responses use HTTP 200 and require checking JSON `code`; successful message acceptance only means entry into an in-memory queue. Stop with `docker stop --time 70 telegram-bots` to allow draining.
 

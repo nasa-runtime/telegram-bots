@@ -131,7 +131,11 @@ spec:
 
 ## Nacos
 
+两种完整 Docker 启动命令、参数表、认证环境文件及端口映射示例见[中文 README 的 Docker 启动](../README.md#docker-启动)和[英文 README](../README.en.md#run-with-docker)。不使用 Nacos 时设置 `APP_PROFILE=`、`APP__REST_DISCOVERY__ENABLED=false`；使用时设置 `APP_PROFILE=nacos`、`APP__REST_DISCOVERY__ENABLED=true`。
+
 设置 `APP_PROFILE=nacos`，提供 `NACOS_SERVER_ADDR`、`TELEGRAM_REGISTER_IP`，以及环境需要的 `NACOS_NAMESPACE`、`NACOS_GROUP`、`NACOS_USERNAME`、`NACOS_PASSWORD`。注册 IP 必须能被调用方访问；Pod 中可通过 Downward API 注入 `status.podIP`。
+
+`NACOS_SERVER_ADDR` 使用 SDK `host:port`，客户端须能访问主端口及其加 1000 的 gRPC 端口，默认分别为 8848、9848；控制台端口不是 SDK 地址。namespace 填 ID，空值使用默认公共空间。默认服务名 `telegram-bots`，group 为 `DEFAULT_GROUP`。容器 listener 默认为 2060，注册端口默认跟随 listener；Docker 映射到不同宿主机端口时，必须通过 `APP__REST_DISCOVERY__REGISTRATION__PORT` 指定映射端口。`LOCAL_NETWORK_IP` 会优先覆盖注册 IP，通常不应同时注入。
 
 Nacos 只发布实例寻址信息。它不读取 bot YAML，不提供跨实例队列协调，也不替代 HTTP Bearer 认证。来源和 Nacos profile 在启动时固定，调整它们需要重启。
 
@@ -149,6 +153,20 @@ docker build --file docker/Dockerfile --tag telegram-bots:local .
 
 ## 镜像发布
 
-`release` 分支的 Rust 工作流在编译与文档检查成功后，为 amd64、arm64 分别构建镜像归档。`Publish Docker image` 工作流从这些归档发布，不在上传阶段重新构建。手动运行时选择 `release`，提供成功的构建 run ID 和两个已确认的 image ID；流程会核对来源提交、分支、平台、版本和镜像身份，拒绝覆盖已有版本标签。
+`release` 分支的 Rust 工作流在编译与文档检查成功后，为 amd64、arm64 分别构建镜像归档。`Publish Docker image` 工作流从这些归档发布，不在上传阶段重新构建。手动运行时选择 `release`，提供成功的 `build_run_id`、`amd64_config_digest` 和 `arm64_config_digest`。后两项是已确认归档中镜像配置 JSON 的 SHA-256，格式为 `sha256:<64 位十六进制>`；不是镜像 manifest 的摘要。Docker 的存储后端对 `image inspect` 的 ID 表示可能不同，应直接从归档计算：
+
+```sh
+python3 - telegram-bots-amd64.tar telegram-bots-arm64.tar <<'PY'
+import hashlib, json, sys, tarfile
+for filename in sys.argv[1:]:
+    with tarfile.open(filename) as archive:
+        entries = json.load(archive.extractfile('manifest.json'))
+        assert len(entries) == 1
+        config = archive.extractfile(entries[0]['Config']).read()
+        print(filename, 'sha256:' + hashlib.sha256(config).hexdigest())
+PY
+```
+
+流程核对来源提交、分支、平台、版本、配置摘要及加载后的文件系统层，拒绝用不同内容覆盖已有版本标签。
 
 GitHub Actions 使用 Secret `DOCKERHUB_TOKEN`、Variable `DOCKERHUB_USERNAME`。个人仓库默认以用户名作为 namespace；`DOCKERHUB_NAMESPACE` 可显式指定，本项目目标为 `nasaruntime/telegram-bots`。Token 需要镜像推送与仓库说明更新权限。镜像版本取自 `Cargo.toml`；发布过程同时更新 Docker Hub 概览，最后让 `latest` 指向该版本。若版本已上传而后续步骤失败，需按远端现状处理，不能通过覆盖版本标签掩盖部分完成状态。
