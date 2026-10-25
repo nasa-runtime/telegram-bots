@@ -1,0 +1,149 @@
+name: Update Docker repository metadata
+
+on:
+  workflow_dispatch:
+    inputs:
+      documentation_run_id:
+        description: Successful release Rust workflow for the current documentation commit
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: dockerhub-telegram-bots
+  cancel-in-progress: false
+
+jobs:
+  metadata:
+    if: github.ref == 'refs/heads/release'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      DOCUMENTATION_RUN_ID: ${{ inputs.documentation_run_id }}
+      HUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+      HUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Verify documentation source and update overview
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, re, subprocess, tomllib, urllib.parse, urllib.request
+          from pathlib import Path
+
+          run_id = os.environ["DOCUMENTATION_RUN_ID"]
+          assert re.fullmatch(r"[0-9]+", run_id), "Invalid documentation run ID"
+          repo, sha = os.environ["GITHUB_REPOSITORY"], os.environ["GITHUB_SHA"]
+          assert repo == "nasa-runtime/telegram-bots", "Unexpected source repository"
+          run = json.loads(
+              subprocess.check_output(["gh", "api", f"repos/{repo}/actions/runs/{run_id}"])
+          )
+          assert (
+              run["head_sha"] == sha and run["head_branch"] == "release"
+          ), "Documentation source differs"
+          assert (
+              run["event"] in ["push", "workflow_dispatch"]
+              and run["path"] == ".github/workflows/ci.yml"
+          ), "Unexpected build source"
+          assert (
+              run["status"] == "completed" and run["conclusion"] == "success"
+          ), "Successful documentation build required"
+          for branch in ["master", "release"]:
+              ref = json.loads(
+                  subprocess.check_output(["gh", "api", f"repos/{repo}/git/ref/heads/{branch}"])
+              )
+              assert ref["object"]["sha"] == sha, f"{branch} has a different revision"
+          version = tomllib.loads(Path("Cargo.toml").read_text())["package"]["version"]
+          assert re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version), "Stable version required"
+          image = "nasaruntime/telegram-bots"
+          overview = Path("docker/README.md").read_text()
+          description = "Rust Telegram notification gateway with hot reload, authentication and per-bot message ordering."
+          assert 0 < len(overview.encode("utf-8")) <= 25000, "Overview exceeds its UTF-8 budget"
+          assert 0 < len(description.encode("utf-8")) <= 100, "Summary exceeds its UTF-8 budget"
+          query = urllib.parse.urlencode(
+              {"service": "registry.docker.io", "scope": f"repository:{image}:pull"}
+          )
+          with urllib.request.urlopen(
+              f"https://auth.docker.io/token?{query}", timeout=30
+          ) as response:
+              registry_token = json.load(response)["token"]
+
+
+          def manifest(reference):
+              """业务作用：固定现有镜像入口，避免更新说明时误认产品版本。
+              参数说明：
+              - reference：待确认的镜像标签或平台清单摘要。
+              返回：摘要经校验的清单原文和对象；无法确认时停止公开写入。
+              """
+              request = urllib.request.Request(
+                  f"https://registry-1.docker.io/v2/{image}/manifests/{reference}",
+                  headers={
+                      "Authorization": f"Bearer {registry_token}",
+                      "Accept": "application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json",
+                  },
+              )
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  raw = response.read()
+                  digest = "sha256:" + hashlib.sha256(raw).hexdigest()
+                  assert (
+                      response.headers["Docker-Content-Digest"] == digest
+                  ), "Registry content differs"
+                  if reference.startswith("sha256:"):
+                      assert reference == digest, "Requested manifest differs"
+                  return raw, json.loads(raw)
+
+
+          version_raw, current = manifest(version)
+          latest_raw, _ = manifest("latest")
+          entries = current["manifests"]
+          assert sorted(
+              (item["platform"]["os"], item["platform"]["architecture"]) for item in entries
+          ) == [("linux", "amd64"), ("linux", "arm64")], "Unexpected published platforms"
+          for entry in entries:
+              _, platform = manifest(entry["digest"])
+              assert re.fullmatch(
+                  r"sha256:[a-f0-9]{64}", platform["config"]["digest"]
+              ), "Invalid published image identity"
+
+          # 只有文档构建与现有产品身份均可确认时才更新概述，凭据只用于目标仓库。
+          credentials = {
+              "identifier": os.environ["HUB_USERNAME"],
+              "secret": os.environ["HUB_TOKEN"],
+          }
+          request = urllib.request.Request(
+              "https://hub.docker.com/v2/auth/token",
+              data=json.dumps(credentials).encode(),
+              headers={"Content-Type": "application/json"},
+          )
+          with urllib.request.urlopen(request, timeout=30) as response:
+              hub_token = json.load(response)["access_token"]
+          print(f"::add-mask::{hub_token}")
+          url = f"https://hub.docker.com/v2/repositories/{image}/"
+          request = urllib.request.Request(
+              url,
+              data=json.dumps(
+                  {"description": description, "full_description": overview}
+              ).encode(),
+              headers={
+                  "Content-Type": "application/json",
+                  "Authorization": f"Bearer {hub_token}",
+              },
+              method="PATCH",
+          )
+          with urllib.request.urlopen(request, timeout=30):
+              pass
+          request = urllib.request.Request(url, headers={"Authorization": f"Bearer {hub_token}"})
+          with urllib.request.urlopen(request, timeout=30) as response:
+              updated = json.load(response)
+          assert (
+              updated["description"] == description and updated["full_description"] == overview
+          ), "Published overview differs"
+          # 概述更新不应改变部署内容，结束前复验两个公开标签仍指向原清单。
+          assert (
+              manifest(version)[0] == version_raw and manifest("latest")[0] == latest_raw
+          ), "Published image identity changed"
+          print(f"Updated {image} overview; version and latest manifests remain unchanged")
+          PY

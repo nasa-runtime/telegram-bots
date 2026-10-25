@@ -131,7 +131,7 @@ spec:
 
 ## Nacos
 
-两种完整 Docker 启动命令、参数表、认证环境文件及端口映射示例见[中文 README 的 Docker 启动](../README.md#docker-启动)和[英文 README](../README.en.md#run-with-docker)。不使用 Nacos 时设置 `APP_PROFILE=`、`APP__REST_DISCOVERY__ENABLED=false`；使用时设置 `APP_PROFILE=nacos`、`APP__REST_DISCOVERY__ENABLED=true`。
+两种完整 Docker 启动命令、参数表、认证环境文件及端口映射示例见 [Docker Hub 使用说明](../docker/README.md)。不使用 Nacos 时设置 `APP_PROFILE=`、`APP__REST_DISCOVERY__ENABLED=false`；使用时设置 `APP_PROFILE=nacos`、`APP__REST_DISCOVERY__ENABLED=true`。
 
 设置 `APP_PROFILE=nacos`，提供 `NACOS_SERVER_ADDR`、`TELEGRAM_REGISTER_IP`，以及环境需要的 `NACOS_NAMESPACE`、`NACOS_GROUP`、`NACOS_USERNAME`、`NACOS_PASSWORD`。注册 IP 必须能被调用方访问；Pod 中可通过 Downward API 注入 `status.podIP`。
 
